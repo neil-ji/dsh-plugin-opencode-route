@@ -57,13 +57,47 @@ config:
   cache: { lockAfterTurns: 2, lockAfterInputTokens: 20000, persistPins: true }
 ```
 
+## How to verify it actually helps
+
+Every decision records its own counterfactual: the probe round tests the session's **own** id
+first, so the log carries both "what you would have got" and "what you got".
+
+```bash
+node scripts/effectiveness.mjs
+```
+
+```
+decisions 2 · kept natural 1 · switched 1
+natural route: ok 1 · rejected 1 · dead 0
+
+session        source   natural  chosen   gain
+0820e3ded68e  probe          0     163      -
+a00e79b8f48f  natural      143     143   1.00
+```
+
+How to read it:
+
+- **kept natural** — the session's own route was already acceptable, so the plugin pinned nothing and
+  the prompt cache stayed warm. This is the case you want to dominate.
+- **median gain** — among switched sessions with a measurable natural route, how much faster the
+  chosen one was. Above 1 means the switching pays for itself.
+- **dead / rejected natural** — the session would have landed on a 429 upstream or a route too slow to
+  admit; switching is a straight win there.
+
+The same numbers are in the UI: hover the header chip (决策 / 保留 / 换道 / 中位提升) or run `/route stats`.
+
+A strict A/B is still possible if you want one: set `dryRun: true` for a day, then `enabled` for a
+day, and compare the per-session median `tps` of `turn` events in the two windows. The built-in
+counterfactual usually makes that unnecessary.
+
 ## Observability
 
 - **Header chip**: `● 170 tok/s hex32` plus `↻`. Hover for the pinned id, probe value, pool best,
   cache lock state, candidate pool and the last three requests. `↻` re-picks immediately.
-- **`/route`**: text dump of the pool, pins and recent requests. `/route repin` forces a re-pick.
+- **`/route`**: text dump of the pool, pins and recent requests. `/route repin` forces a re-pick,
+  `/route stats` prints the effectiveness numbers.
 - **Event log**: `%DSH_HOME%\opencode-route\events.jsonl` — `probe`, `probe-reject`, `probe-dead`,
-  `probe-round`, `pin`, `skip-pin`, `turn`, `evict`, `repin`.
+  `probe-round`, `keep-natural`, `compare`, `pin`, `skip-pin`, `turn`, `evict`, `repin`.
 - **HTTP**: `GET /opencode-route/status?session=<id>`, `POST /opencode-route/repin?session=<id>`.
 
 ## Known limits

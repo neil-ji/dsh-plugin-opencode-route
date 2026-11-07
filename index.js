@@ -125,7 +125,13 @@ export function apply(ctx, config = {}) {
   const baselines = new Map();
   /** @type {Array<object>} */
   const recent = [];
-  const counters = { requests: 0, probes: 0, probeRounds: 0, leases: 0, evictions: 0, failures: 0, slow: 0 };
+  const counters = { requests: 0, probes: 0, probeRounds: 0, leases: 0, evictions: 0, failures: 0, slow: 0, keptNatural: 0, switched: 0 };
+  /** @type {Map<string, {source: string, naturalTps: number, naturalShape: string, chosenTps: number}>} */
+  const compare = new Map();
+  /** @type {Map<string, {status: string, tps: number, shape: string, ttfbMs: number|null}>} */
+  const naturalProbe = new Map();
+  /** @type {Map<string, {at: number, tps: number}>} */
+  const naturalKeep = new Map();
 
   const logDir = cfg.logDir || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'opencode-route');
   const pinsPath = path.join(logDir, 'pins.json');
@@ -311,16 +317,29 @@ export function apply(ctx, config = {}) {
 
   async function probeRoundInner(provider, model, sessionId) {
     const poolKey = poolKeyOf(provider, model);
-    const candidates = Array.from({ length: Math.max(1, probeCfg.candidates) }, () => `session-${randomUUID()}`);
+    // The session's own id is candidate zero: it is the counterfactual "what you
+    // would have got without this plugin", and when it is already good the round
+    // stops there and the session is never moved (so its cache stays warm).
+    const candidates = [sessionId, ...Array.from({ length: Math.max(1, probeCfg.candidates) }, () => `session-${randomUUID()}`)]
+      .filter((id, index, all) => typeof id === 'string' && all.indexOf(id) === index);
     const alive = [];
     for (const candidateId of candidates) {
       if (probesThisHour() >= poolCfg.maxProbesPerHour) break;
       const result = await probeOne(provider, model, candidateId);
+      const isNatural = candidateId === sessionId;
+      if (isNatural) {
+        naturalProbe.set(pairKey(provider, sessionId), {
+          status: result.alive ? (admittable(result) ? 'ok' : 'rejected') : 'dead',
+          tps: result.tps === null || result.tps === undefined ? 0 : Math.round(result.tps),
+          shape: result.shape ?? 'none',
+          ttfbMs: result.ttfbMs ?? null,
+        });
+      }
       if (result.alive) {
         const ok = admittable(result);
         log({
           kind: ok ? 'probe' : 'probe-reject',
-          provider, model, id: candidateId, shape: result.shape,
+          provider, model, id: candidateId, natural: candidateId === sessionId, shape: result.shape,
           tps: result.tps === null ? null : Math.round(result.tps),
           ttfbMs: result.ttfbMs, totalMs: result.totalMs, measured: result.measured,
         });
@@ -330,7 +349,7 @@ export function apply(ctx, config = {}) {
           if (result.measured && result.tps >= thresholds.targetTps) break;
         }
       } else {
-        log({ kind: 'probe-dead', provider, model, id: candidateId, reason: result.reason });
+        log({ kind: 'probe-dead', provider, model, id: candidateId, natural: candidateId === sessionId, reason: result.reason });
       }
     }
     const now = Date.now();
@@ -395,6 +414,9 @@ export function apply(ctx, config = {}) {
     const key = pairKey(provider, sessionId);
     await pinsReady;
     const existing = pins.get(key);
+    const kept = naturalKeep.get(key);
+    if (kept !== undefined && Date.now() - kept.at < 600000 && !forceRepin.has(key)) return undefined;
+    if (forceRepin.has(key)) naturalKeep.delete(key);
     // A session keeps its route for as long as it lives: every switch costs one
     // full re-prefill of the whole context, which is the expensive thing here.
     if (existing !== undefined && existing.model === model && !forceRepin.has(key)) return existing.id;
@@ -430,6 +452,30 @@ export function apply(ctx, config = {}) {
       await ensurePool(poolKey, provider, model, sessionId);
       const entry = pickEntry(poolKey, sessionId);
       if (entry === undefined) return undefined;
+      if (entry.id === sessionId) {
+        // The session's own route won the round: pin nothing, keep the cache.
+        const naturalEntry = (pool.get(poolKey) ?? []).find((row) => row.id === sessionId);
+        counters.keptNatural += 1;
+        naturalKeep.set(key, { at: Date.now(), tps: Math.round(entry.tps ?? 0) });
+        compare.set(pairKey(provider, sessionId), {
+          source: 'natural',
+          naturalTps: Math.round(naturalEntry?.tps ?? entry.tps ?? 0),
+          naturalShape: naturalEntry?.shape ?? entry.shape,
+          chosenTps: Math.round(entry.tps ?? 0),
+        });
+        log({
+          kind: 'keep-natural', provider, model, sessionId,
+          tps: Math.round(entry.tps ?? 0), shape: entry.shape, ttfbMs: entry.ttfbMs ?? null,
+        });
+        log({
+          kind: 'compare', provider, model, sessionId, source: 'natural',
+          naturalStatus: naturalProbe.get(key)?.status ?? 'unknown',
+          naturalTps: Math.round(naturalEntry?.tps ?? entry.tps ?? 0),
+          naturalShape: naturalEntry?.shape ?? entry.shape,
+          chosenTps: Math.round(entry.tps ?? 0), chosenShape: entry.shape,
+        });
+        return undefined;
+      }
       // Never replace a route that is already working with a demonstrably worse one.
       if (baseline !== undefined && baseline.ttfb > 0 && entry.ttfbMs !== undefined) {
         const worseTtfb = entry.ttfbMs > baseline.ttfb * 1.2;
@@ -457,8 +503,24 @@ export function apply(ctx, config = {}) {
     if (typeof id !== 'string' || id.length === 0) return undefined;
     let probeTps = 0;
     for (const entries of pool.values()) for (const entry of entries) if (entry.id === id) probeTps = entry.tps;
+    const naturalEntry = (pool.get(poolKeyOf(provider, model)) ?? []).find((row) => row.id === sessionId);
+    counters.switched += 1;
+    compare.set(key, {
+      source: 'probe',
+      naturalTps: Math.round(naturalEntry?.tps ?? 0),
+      naturalShape: naturalEntry?.shape ?? 'none',
+      chosenTps: Math.round(probeTps),
+    });
     pins.set(key, { id, model, at: Date.now(), provider, probeTps });
+    naturalKeep.delete(key);
     savePins();
+    log({
+      kind: 'compare', provider, model, sessionId, source: 'probe',
+      naturalStatus: naturalProbe.get(key)?.status ?? 'unknown',
+      naturalTps: Math.round(naturalEntry?.tps ?? 0),
+      naturalShape: naturalEntry?.shape ?? 'none',
+      chosenTps: Math.round(probeTps), chosenShape: entryShapeOf(id),
+    });
     log({ kind: 'pin', provider, model, sessionId, id });
     return id;
   }
@@ -597,6 +659,22 @@ export function apply(ctx, config = {}) {
       // A short probe can read ~2x faster than the real request. While the
       // context is still cheap, take one corrective switch instead of living
       // with a route that measurably underperforms its own probe.
+      if (pinnedId === undefined && sessionId !== undefined && kind !== 'error' && kind !== 'thrown' && tps !== null && out >= 60) {
+        const keepKey = pairKey(provider, sessionId);
+        const kept = naturalKeep.get(keepKey);
+        const keepBase = baselines.get(keepKey);
+        if (kept !== undefined
+          && tps < thresholds.degradeTps
+          && (keepBase?.n ?? 0) <= 3
+          && (repinAllowance.get(keepKey) ?? 0) < 1) {
+          repinAllowance.set(keepKey, 1);
+          naturalKeep.delete(keepKey);
+          log({
+            kind: 'natural-slow', provider, model, sessionId,
+            probeTps: kept.tps, realTps: Math.round(tps),
+          });
+        }
+      }
       if (pinnedId !== undefined && sessionId !== undefined && kind !== 'error' && kind !== 'thrown' && tps !== null && out >= 60) {
         const key = pairKey(provider, sessionId);
         const pin = pins.get(key);
@@ -644,9 +722,33 @@ export function apply(ctx, config = {}) {
     releaseLease(String(id));
   });
 
+  function entryShapeOf(id) {
+    for (const entries of pool.values()) for (const entry of entries) if (entry.id === id) return entry.shape;
+    return 'none';
+  }
+
   function pinFor(sessionId) {
     for (const [key, pin] of pins) if (key.endsWith(`\u0000${sessionId}`)) return pin;
     return undefined;
+  }
+
+  function summarizeCompare() {
+    const rows = [...compare.values()].filter((row) => row.naturalTps > 0 && row.chosenTps > 0);
+    const switched = rows.filter((row) => row.source === 'probe');
+    const gains = switched.map((row) => row.chosenTps / row.naturalTps).sort((a, b) => a - b);
+    const median = (list) => (list.length ? list[Math.floor((list.length - 1) / 2)] : 0);
+    const naturalMedians = rows.map((row) => row.naturalTps).sort((a, b) => a - b);
+    const chosenMedians = switched.map((row) => row.chosenTps).sort((a, b) => a - b);
+    return {
+      decisions: rows.length,
+      keptNatural: rows.filter((row) => row.source === 'natural').length,
+      switched: switched.length,
+      medianNaturalWhenSwitched: Math.round(median(naturalMedians)),
+      medianChosenWhenSwitched: Math.round(median(chosenMedians)),
+      medianGain: gains.length ? Math.round(median(gains) * 100) / 100 : 0,
+      improved: gains.filter((g) => g > 1.1).length,
+      worse: gains.filter((g) => g < 0.9).length,
+    };
   }
 
   function statusPayload(sessionId) {
@@ -690,6 +792,8 @@ export function apply(ctx, config = {}) {
       locked,
       probe: probeState,
       pinned: pin === undefined ? null : { id: pin.id, shape: last?.shape ?? null, probeTps: Math.round(pin.probeTps ?? 0) },
+      compare: sessionId === undefined ? null : (compare.get(pairKey(pin?.provider ?? cfg.providers[0] ?? '', sessionId)) ?? null),
+      stats: summarizeCompare(),
       best,
       last: last ?? null,
       turns,
@@ -706,6 +810,7 @@ export function apply(ctx, config = {}) {
     const model = lastTurn?.model ?? restored?.model;
     if (model === undefined || model.length === 0) return { ok: false, error: '这个会话还没发过请求，先发一条消息再来选道。' };
     const key = pairKey(provider, sessionId);
+    naturalKeep.delete(key);
     const old = pins.get(key);
     if (old !== undefined) invalidateId(old.id, 'repin-now');
     const poolKey = poolKeyOf(provider, model);
@@ -721,7 +826,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.6.0',
+    version: '1.7.2',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     subagentMode: cfg.subagents.mode,
@@ -798,6 +903,15 @@ export function apply(ctx, config = {}) {
       description: 'Show OpenCode Go route pins, the lease pool, and recent speeds',
       handler: (invocation) => {
         const raw = String(invocation?.rawInput ?? '').trim().toLowerCase();
+        if (raw === 'stats' || raw === '效果' || raw === '验证') {
+          const s = summarizeCompare();
+          const lines = [
+            `选道决策 ${s.decisions} 次：保留原生 ${s.keptNatural} 次，换道 ${s.switched} 次`,
+            `换道场次里：原生中位 ${s.medianNaturalWhenSwitched} tok/s → 选中中位 ${s.medianChosenWhenSwitched} tok/s，中位提升 ${s.medianGain}×`,
+            `其中明显变快 ${s.improved} 次，明显变慢 ${s.worse} 次`,
+          ];
+          return { kind: 'success', text: lines.join('\n') };
+        }
         if (raw === 'repin' || raw === 'repick') {
           const sessionId = invocation?.agent?.session?.id;
           if (sessionId === undefined) return { kind: 'error', text: '没有活动会话，无法重新选道。' };

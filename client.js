@@ -170,6 +170,12 @@ window.__ModuleLoader__.load({
         data.pinned.probeTps ? ` · 探测 ${data.pinned.probeTps}` : ''));
       if (best) tipRows.push(h('div', { key: 'best' }, '池最优 ', h('b', { className: 'num' }, `${best} tok/s`),
         data.locked ? ' · 已缓存锁定（不会再自动换道）' : ''));
+      const st = data.stats;
+      if (st && st.decisions) {
+        tipRows.push(h('div', { key: 'stats' },
+          `效果：决策 ${st.decisions} 次 · 保留原生 ${st.keptNatural} · 换道 ${st.switched}`,
+          st.switched ? ` · 中位提升 ${st.medianGain}×` : ''));
+      }
       if (data.pool && data.pool.length) {
         tipRows.push(h('div', { key: 'pool', style: { marginTop: '2px' } }, h('b', null, '候选池')));
         data.pool.slice(0, 5).forEach((row, index) => tipRows.push(h('div', { key: `p${index}` },
