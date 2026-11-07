@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "OpenCode Go 路由选择",
+    "description": "探测候选会话 id，把每个 OpenCode Go 会话（含子 agent）钉在最快的网关路由上。"
+  }
+}

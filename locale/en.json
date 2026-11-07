@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "OpenCode Go route picker",
+    "description": "Probes candidate session ids and pins each OpenCode Go session (including sub-agents) to the fastest gateway route."
+  }
+}

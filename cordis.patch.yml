@@ -1,0 +1,34 @@
+# Inserts only this plugin's own row.
+#
+# Scope is deliberately narrow: `providers` is an exact allowlist, so no other
+# model provider is measured, retried, or given an `x-opencode-session` header.
+- insert:
+    - id: opencode-route
+      name: dsh-plugin-opencode-route
+      config:
+        enabled: true
+        dryRun: false
+        providers:
+          - opencode-go
+        models: []
+        probe:
+          enabled: true
+          candidates: 4
+          maxTokens: 96
+          timeoutMs: 25000
+          ttfbMaxMs: 5000
+          totalMaxMs: 15000
+        thresholds:
+          targetTps: 150
+          degradeTps: 70
+          strikesToEvict: 2
+          degradeTtfbMs: 20000
+        pool:
+          size: 4
+          ttlMs: 300000
+          negativeTtlMs: 60000
+          maxProbesPerHour: 40
+        cache:
+          lockAfterTurns: 2
+          lockAfterInputTokens: 20000
+          persistPins: true
