@@ -26,13 +26,17 @@ a shared pool (sub-agent sessions lease from the same pool), and pins it by over
 
 ## Install
 
-```bash
-# from the profile that runs the harness
-dsh plugin install /absolute/path/to/dsh-plugin-opencode-route
-```
+A DSH profile installs a bundle from a package directory; there is no build step.
 
-or point `plugin_manager` `install_bundle` at the directory. The row lands as `opencode-route` and
-is scoped to `opencode-go` by default.
+1. Clone (or copy) this directory anywhere on the machine.
+2. Install it into the running profile with the `plugin_manager` tool:
+
+   ```
+   plugin_manager  action=install_bundle  target=<absolute path to this directory>
+   ```
+
+   The row lands as `opencode-route`, enabled, and scoped to `opencode-go`.
+3. Refresh the Web UI so the client half loads.
 
 Requires a DSH build that exposes `llm/stream`, `llm-pi-ai/request-headers`, `webServer` and
 `commands` — the plugin waits for each service rather than reading it once at load.
