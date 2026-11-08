@@ -17,7 +17,7 @@
 // It never reads credentials: probe calls go through ctx.llm, so the configured
 // provider resolves its own key.
 
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -36,6 +36,7 @@ const DEFAULTS = {
     candidates: 4,
     maxTokens: 96,
     timeoutMs: 25000,
+    roundMaxMs: 8000,   // whole round, so one hung candidate cannot stall a request
     ttfbMaxMs: 5000,    // a candidate slower than this to first token is not worth pinning
     totalMaxMs: 15000,
     prompt: 'Write the integers from 1 to 40 in order, separated by single spaces, and nothing else.',
@@ -115,6 +116,14 @@ const poolKeyOf = (provider, model) => `${provider}\u0000${model}`;
 // No single stream generates faster than this; above it the number is buffering.
 const PLAUSIBLE_TPS = 1000;
 
+// Per-session maps are advisory caches: cap them so a long-lived process cannot
+// grow without bound. Pins get an age sweep instead of an order-based cap, so a
+// session that is still in use never loses its route.
+const MAP_CAP = 2000;
+const STALE_MS = 86_400_000;
+const PRUNE_MS = 600_000;
+const LOG_MAX_BYTES = 8 * 1024 * 1024;
+
 const SHAPE_RANK = { gw: 0, hex32: 1, hex40: 1, hex48: 2, msg: 2, chatcmpl: 3, other: 3, none: 4 };
 
 export function apply(ctx, config = {}) {
@@ -142,6 +151,7 @@ export function apply(ctx, config = {}) {
   const counters = { requests: 0, probes: 0, probeRounds: 0, leases: 0, evictions: 0, failures: 0, slow: 0, keptNatural: 0, switched: 0 };
   /** @type {Map<string, {source: string, naturalTps: number, naturalShape: string, chosenTps: number}>} */
   const compare = new Map();
+  let compareSummary = null;
   /** @type {Map<string, {status: string, tps: number, shape: string, ttfbMs: number|null}>} */
   const naturalProbe = new Map();
   /** @type {Map<string, {at: number, tps: number}>} */
@@ -150,6 +160,8 @@ export function apply(ctx, config = {}) {
   const logDir = cfg.logDir || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'opencode-route');
   const pinsPath = path.join(logDir, 'pins.json');
   let logReady = false;
+  let logBytes = 0;
+  let logQueue = Promise.resolve();
   let hourWindow = { start: Date.now(), count: 0 };
   let saveTimer;
   let probeState = { active: false, startedAt: 0, candidates: 0 };
@@ -207,18 +219,23 @@ export function apply(ctx, config = {}) {
         ttfb: typeof row.ttfbMs === 'number' ? row.ttfbMs : (prev?.ttfb ?? 0),
         n: (prev?.n ?? 0) + 1,
         lastInput: Number(row.inputTokens ?? 0) + Number(row.cacheReadTokens ?? 0),
+        at: Number.isNaN(Date.parse(row.ts)) ? Date.now() : Date.parse(row.ts),
         out: (prev?.out ?? 0) + (Number(row.decodeMs ?? 0) > 0 ? Number(row.out ?? 0) : 0),
         decode: (prev?.decode ?? 0) + Number(row.decodeMs ?? 0),
       });
     }
     for (const row of compares) {
       compare.set(pairKey(row.provider, row.sessionId), {
+        at: Date.now(),
         source: String(row.source ?? 'probe'),
         naturalTps: Number(row.naturalTps ?? 0),
         naturalShape: String(row.naturalShape ?? 'none'),
         chosenTps: Number(row.chosenTps ?? 0),
       });
+      compareSummary = null;
     }
+    capMap(baselines);
+    capMap(compare);
   }
 
   let resolvePinsReady;
@@ -241,6 +258,7 @@ export function apply(ctx, config = {}) {
           if (typeof row.at === 'number' && row.at < cutoff) continue;
           pins.set(row.key, { id: row.id, model: String(row.model ?? ''), at: Number(row.at ?? 0), provider: String(row.provider ?? ''), probeTps: Number(row.probeTps ?? 0) });
         }
+        capMap(pins);
       }
     } catch { /* first run */ }
     try { await restoreFromLog(); } catch { /* a broken log must not block startup */ }
@@ -260,17 +278,39 @@ export function apply(ctx, config = {}) {
     return digest.readUInt32BE(0) / 2 ** 32 < expCfg.armRatio ? 'treatment' : 'control';
   }
 
+  function capMap(map) {
+    while (map.size > MAP_CAP) map.delete(map.keys().next().value);
+  }
+
+  function pruneStale() {
+    const cutoff = Date.now() - STALE_MS;
+    for (const [key, pin] of pins) if ((pin.at ?? 0) < cutoff) pins.delete(key);
+    for (const [key, base] of baselines) if ((base.at ?? 0) < cutoff) baselines.delete(key);
+  }
+
   function log(record) {
     const row = { ts: new Date().toISOString(), ...record };
     recent.push(row);
     if (recent.length > 200) recent.shift();
     const line = `${JSON.stringify(row)}\n`;
-    void (async () => {
+    // Serialize writes: one chain orders the lines and makes rotation safe. The
+    // byte count tracks what actually reached the file, not what is queued,
+    // otherwise a burst would rotate before the file exists.
+    logQueue = logQueue.then(async () => {
       try {
         if (!logReady) { await mkdir(logDir, { recursive: true }); logReady = true; }
-        await appendFile(path.join(logDir, 'events.jsonl'), line, 'utf8');
+        const file = path.join(logDir, 'events.jsonl');
+        if (logBytes > LOG_MAX_BYTES) {
+          try {
+            await rm(path.join(logDir, 'events.1.jsonl'), { force: true });
+            await rename(file, path.join(logDir, 'events.1.jsonl'));
+          } catch { /* a missing file just means nothing to rotate */ }
+          logBytes = 0;
+        }
+        await appendFile(file, line, 'utf8');
+        logBytes += Buffer.byteLength(line);
       } catch { /* logging must never break a request */ }
-    })();
+    });
   }
 
   function probesThisHour() {
@@ -333,14 +373,18 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  async function probeOne(provider, model, candidateId) {
+  async function probeOne(provider, model, candidateId, roundSignal) {
+    const timeout = AbortSignal.timeout(probeCfg.timeoutMs);
+    const signal = roundSignal !== undefined && typeof AbortSignal.any === 'function'
+      ? AbortSignal.any([timeout, roundSignal])
+      : timeout;
     const options = {
       provider,
       model,
       messages: [{ role: 'user', content: [{ type: 'text', text: probeCfg.prompt }] }],
       maxTokens: probeCfg.maxTokens,
       sessionId: candidateId,
-      signal: AbortSignal.timeout(probeCfg.timeoutMs),
+      signal,
     };
     probing.add(options);
     counters.probes += 1;
@@ -441,35 +485,48 @@ export function apply(ctx, config = {}) {
     const candidates = [sessionId, ...Array.from({ length: Math.max(1, probeCfg.candidates) }, () => `session-${randomUUID()}`)]
       .filter((id, index, all) => typeof id === 'string' && all.indexOf(id) === index);
     const alive = [];
-    for (const candidateId of candidates) {
-      if (probesThisHour() >= poolCfg.maxProbesPerHour) break;
-      const result = await probeOne(provider, model, candidateId);
-      const isNatural = candidateId === sessionId;
-      if (isNatural) {
-        naturalProbe.set(pairKey(provider, sessionId), {
-          status: result.alive ? (admittable(result) ? 'ok' : 'rejected') : 'dead',
-          tps: result.tps === null || result.tps === undefined ? 0 : Math.round(result.tps),
-          shape: result.shape ?? 'none',
-          ttfbMs: result.ttfbMs ?? null,
-        });
-      }
-      if (result.alive) {
-        const ok = admittable(result);
-        log({
-          kind: ok ? 'probe' : 'probe-reject',
-          provider, model, sessionId, id: candidateId, natural: candidateId === sessionId, shape: result.shape,
-          tps: result.tps === null ? null : Math.round(result.tps),
-          ttfbMs: result.ttfbMs, totalMs: result.totalMs, measured: result.measured,
-        });
-        if (ok) {
-          alive.push(result);
-          // One rule for every shape: stop when this candidate already reaches
-          // the target. A slow `gw` no longer ends the search early.
-          if (scoreOf(result) >= thresholds.targetTps) break;
+    // One hung candidate must not stall the request that triggered the round:
+    // bound the whole round and let the abort signal reach the in-flight probe.
+    const controller = new AbortController();
+    const roundMs = Math.max(1000, probeCfg.roundMaxMs ?? 8000);
+    const deadline = Date.now() + roundMs;
+    const timer = setTimeout(() => controller.abort(), roundMs);
+    timer?.unref?.();
+    try {
+      for (const candidateId of candidates) {
+        if (controller.signal.aborted || Date.now() > deadline - 500) break;
+        if (probesThisHour() >= poolCfg.maxProbesPerHour) break;
+        const result = await probeOne(provider, model, candidateId, controller.signal);
+        const isNatural = candidateId === sessionId;
+        if (isNatural) {
+          naturalProbe.set(pairKey(provider, sessionId), {
+            status: result.alive ? (admittable(result) ? 'ok' : 'rejected') : 'dead',
+            tps: result.tps === null || result.tps === undefined ? 0 : Math.round(result.tps),
+            shape: result.shape ?? 'none',
+            ttfbMs: result.ttfbMs ?? null,
+          });
+          capMap(naturalProbe);
         }
-      } else {
-        log({ kind: 'probe-dead', provider, model, sessionId, id: candidateId, natural: candidateId === sessionId, reason: result.reason });
+        if (result.alive) {
+          const ok = admittable(result);
+          log({
+            kind: ok ? 'probe' : 'probe-reject',
+            provider, model, sessionId, id: candidateId, natural: candidateId === sessionId, shape: result.shape,
+            tps: result.tps === null ? null : Math.round(result.tps),
+            ttfbMs: result.ttfbMs, totalMs: result.totalMs, measured: result.measured,
+          });
+          if (ok) {
+            alive.push(result);
+            // One rule for every shape: stop when this candidate already reaches
+            // the target. A slow `gw` no longer ends the search early.
+            if (scoreOf(result) >= thresholds.targetTps) break;
+          }
+        } else {
+          log({ kind: 'probe-dead', provider, model, sessionId, id: candidateId, natural: candidateId === sessionId, reason: result.reason });
+        }
       }
+    } finally {
+      clearTimeout(timer);
     }
     const now = Date.now();
     const entries = alive
@@ -578,12 +635,15 @@ export function apply(ctx, config = {}) {
         const naturalEntry = (pool.get(poolKey) ?? []).find((row) => row.id === sessionId);
         counters.keptNatural += 1;
         naturalKeep.set(key, { at: Date.now(), tps: Math.round(entry.tps ?? 0) });
+        capMap(naturalKeep);
         compare.set(pairKey(provider, sessionId), {
           source: 'natural',
           naturalTps: Math.round(naturalEntry?.tps ?? entry.tps ?? 0),
           naturalShape: naturalEntry?.shape ?? entry.shape,
           chosenTps: Math.round(entry.tps ?? 0),
         });
+        compareSummary = null;
+        capMap(compare);
         log({
           kind: 'keep-natural', provider, model, sessionId,
           tps: Math.round(entry.tps ?? 0), shape: entry.shape, ttfbMs: entry.ttfbMs ?? null,
@@ -632,7 +692,10 @@ export function apply(ctx, config = {}) {
       naturalShape: naturalEntry?.shape ?? 'none',
       chosenTps: Math.round(probeTps),
     });
+    compareSummary = null;
+    capMap(compare);
     pins.set(key, { id, model, at: Date.now(), provider, probeTps });
+    capMap(pins);
     naturalKeep.delete(key);
     savePins();
     log({
@@ -774,16 +837,18 @@ export function apply(ctx, config = {}) {
         // DSH's own footer is a weighted session rate (total output / total
         // decode), which is why it never shows a burst: keep the same sums.
         const next = base === undefined
-          ? { tps: tps ?? 0, ttfb: ttfbMs ?? 0, n: 1, lastInput: cacheBase, out: genMs > 0 ? out : 0, decode: genMs > 0 ? genMs : 0 }
+          ? { tps: tps ?? 0, ttfb: ttfbMs ?? 0, n: 1, lastInput: cacheBase, out: genMs > 0 ? out : 0, decode: genMs > 0 ? genMs : 0, at: Date.now() }
           : {
             tps: tps === null ? base.tps : base.tps * 0.6 + tps * 0.4,
             ttfb: ttfbMs === null ? base.ttfb : base.ttfb * 0.6 + ttfbMs * 0.4,
             n: base.n + 1,
             lastInput: cacheBase,
+            at: Date.now(),
             out: (base.out ?? 0) + (genMs > 0 ? out : 0),
             decode: (base.decode ?? 0) + (genMs > 0 ? genMs : 0),
           };
         baselines.set(key, next);
+        capMap(baselines);
         locked = next.n >= cacheCfg.lockAfterTurns || next.lastInput >= cacheCfg.lockAfterInputTokens;
       }
       if (pinnedId !== undefined) {
@@ -802,6 +867,7 @@ export function apply(ctx, config = {}) {
           && (keepBase?.n ?? 0) <= 3
           && (repinAllowance.get(keepKey) ?? 0) < 1) {
           repinAllowance.set(keepKey, 1);
+          capMap(repinAllowance);
           naturalKeep.delete(keepKey);
           log({
             kind: 'natural-slow', provider, model, sessionId,
@@ -818,6 +884,7 @@ export function apply(ctx, config = {}) {
         const allowed = (repinAllowance.get(key) ?? 0) < 1;
         if (early && allowed && probeTps >= 100 && tps < probeTps * 0.6 && tps < thresholds.targetTps) {
           repinAllowance.set(key, 1);
+          capMap(repinAllowance);
           log({
             kind: 'corrective-repin', provider, model, sessionId, id: pinnedId,
             reason: 'probe-overestimated', probeTps: Math.round(probeTps), realTps: Math.round(tps),
@@ -870,13 +937,14 @@ export function apply(ctx, config = {}) {
   }
 
   function summarizeCompare() {
+    if (compareSummary !== null) return compareSummary;
     const rows = [...compare.values()].filter((row) => row.naturalTps > 0 && row.chosenTps > 0);
     const switched = rows.filter((row) => row.source === 'probe');
     const gains = switched.map((row) => row.chosenTps / row.naturalTps).sort((a, b) => a - b);
     const median = (list) => (list.length ? list[Math.floor((list.length - 1) / 2)] : 0);
     const naturalMedians = rows.map((row) => row.naturalTps).sort((a, b) => a - b);
     const chosenMedians = switched.map((row) => row.chosenTps).sort((a, b) => a - b);
-    return {
+    compareSummary = {
       decisions: rows.length,
       keptNatural: rows.filter((row) => row.source === 'natural').length,
       switched: switched.length,
@@ -886,6 +954,7 @@ export function apply(ctx, config = {}) {
       improved: gains.filter((g) => g > 1.1).length,
       worse: gains.filter((g) => g < 0.9).length,
     };
+    return compareSummary;
   }
 
   function statusPayload(sessionId) {
@@ -951,9 +1020,15 @@ export function apply(ctx, config = {}) {
     };
   }
 
+  ctx.effect(() => {
+    const timer = setInterval(pruneStale, PRUNE_MS);
+    timer?.unref?.();
+    return () => clearInterval(timer);
+  });
+
   log({
     kind: 'plugin',
-    version: '1.7.8',
+    version: '1.7.9',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     subagentMode: cfg.subagents.mode,

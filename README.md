@@ -56,7 +56,7 @@ config:
   dryRun: false            # true = observe only, never inject the header
   providers: [opencode-go] # exact allowlist; nothing else is touched
   models: []               # empty = every model of that provider
-  probe: { enabled: true, candidates: 4, maxTokens: 96, timeoutMs: 25000, ttfbMaxMs: 5000, totalMaxMs: 15000 }
+  probe: { enabled: true, candidates: 4, maxTokens: 96, timeoutMs: 25000, roundMaxMs: 8000, ttfbMaxMs: 5000, totalMaxMs: 15000 }
   thresholds: { targetTps: 150, degradeTps: 70, strikesToEvict: 2, degradeTtfbMs: 20000 }
   pool: { size: 4, ttlMs: 300000, negativeTtlMs: 60000, maxProbesPerHour: 40 }
   cache: { lockAfterTurns: 2, lockAfterInputTokens: 20000, persistPins: true }
@@ -150,7 +150,12 @@ apparent effects between 0.92× and 1.06× — and how many sessions the A/B nee
 - A short probe estimates decode speed, not what a 200k-token context will do. The corrective re-pick
   is the safety net.
 - The plugin adds a handful of tiny requests per probe round; keep `maxProbesPerHour` in mind, and
-  note that OpenCode monitors traffic for abuse.
+  note that OpenCode monitors traffic for abuse. A round is bounded by `probe.roundMaxMs` (8 s), so
+  one hung candidate cannot stall the request that triggered it.
+- Per-session bookkeeping (pins, baselines, compare rows) is capped at 2,000 entries; pins and
+  baselines older than 24 h are swept every 10 minutes, so a long-lived process stays bounded.
+  Steady-state overhead is ~0.4 µs per stream chunk and ~10 µs per status call.
+- `events.jsonl` rotates at 8 MB into `events.1.jsonl` (one generation), and writes are serialized.
 
 ## License
 

@@ -179,7 +179,16 @@ window.__ModuleLoader__.load({
           style.textContent = CSS;
           document.head.appendChild(style);
         }
+        let running = false;
         const tick = async () => {
+          if (!alive || running) return;
+          // A hidden window does not need a 3 s poll; check rarely and refresh
+          // immediately when it comes back.
+          if (document.hidden) {
+            timer = setTimeout(tick, 15000);
+            return;
+          }
+          running = true;
           try {
             const res = await fetch(`/opencode-route/status?session=${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
             if (res.ok && alive) {
@@ -194,13 +203,22 @@ window.__ModuleLoader__.load({
             }
           } catch {
             if (alive) setFailures((value) => value + 1);
+          } finally {
+            running = false;
           }
           if (alive) timer = setTimeout(tick, state === 'probing' ? 900 : 3000);
         };
+        const onVisible = () => {
+          if (document.hidden) return;
+          clearTimeout(timer);
+          void tick();
+        };
+        document.addEventListener('visibilitychange', onVisible);
         void tick();
         return () => {
           alive = false;
           clearTimeout(timer);
+          document.removeEventListener('visibilitychange', onVisible);
           if (hideTimer.current) clearTimeout(hideTimer.current);
         };
       }, [sessionId]);
