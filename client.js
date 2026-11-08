@@ -13,6 +13,18 @@ window.__ModuleLoader__.load({
     try { createPortal = require('react-dom').createPortal; } catch { createPortal = null; }
 
     const STYLE_ID = 'opencode-route-chip-style';
+    // The header remounts when the session changes, so the chip would otherwise
+    // start from "no data" every time. Keep the last payload per session: a
+    // switch back paints instantly, and a first visit shows a skeleton instead
+    // of vanishing for a poll interval.
+    const SESSION_CACHE = new Map();
+    const CACHE_LIMIT = 40;
+    function remember(sessionId, payload) {
+      if (sessionId === null) return;
+      SESSION_CACHE.delete(sessionId);
+      SESSION_CACHE.set(sessionId, payload);
+      while (SESSION_CACHE.size > CACHE_LIMIT) SESSION_CACHE.delete(SESSION_CACHE.keys().next().value);
+    }
     const CSS = `
 @keyframes orPulse { 0%{opacity:.35} 50%{opacity:1} 100%{opacity:.35} }
 /* Matches the native session-header control: border-box 24px tall, 8px radius, 1px
@@ -48,6 +60,8 @@ window.__ModuleLoader__.load({
   border-radius:8px;background:rgba(127,127,127,.12);
   font-size:9px;font-weight:600;line-height:1;letter-spacing:.04em;
   color:var(--or-fg2,#61666b)}
+.orSkel{display:block;width:22px;height:7px;border-radius:2px;
+  background:rgba(127,127,127,.18);margin-left:auto}
 .orSrOnly{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
   clip:rect(0 0 0 0);white-space:nowrap;border:0}
 @media (prefers-reduced-motion: reduce){ .orDot.busy{animation:none} }
@@ -143,15 +157,19 @@ window.__ModuleLoader__.load({
 
     function Chip(props) {
       const sessionId = props && props.sessionId ? String(props.sessionId) : null;
-      const [data, setData] = useState(null);
+      const [data, setData] = useState(() => (sessionId === null ? null : SESSION_CACHE.get(sessionId) ?? null));
+      const dataId = useRef(sessionId);
       const [failures, setFailures] = useState(0);
       const [hover, setHover] = useState(false);
       const [anchor, setAnchor] = useState(null);
       const chipRef = useRef(null);
       const hideTimer = useRef(null);
 
+      const current = dataId.current === sessionId ? data : (sessionId === null ? null : SESSION_CACHE.get(sessionId) ?? null);
+
       useEffect(() => {
         if (!sessionId) return undefined;
+        setFailures(0);
         let alive = true;
         let timer;
         let state = null;
@@ -167,6 +185,8 @@ window.__ModuleLoader__.load({
             if (res.ok && alive) {
               const next = await res.json();
               state = next.state;
+              dataId.current = sessionId;
+              remember(sessionId, next);
               setData(next);
               setFailures(0);
             } else if (alive) {
@@ -177,7 +197,7 @@ window.__ModuleLoader__.load({
           }
           if (alive) timer = setTimeout(tick, state === 'probing' ? 900 : 3000);
         };
-        timer = setTimeout(tick, 300);
+        void tick();
         return () => {
           alive = false;
           clearTimeout(timer);
@@ -209,21 +229,26 @@ window.__ModuleLoader__.load({
       };
 
       if (!sessionId) return null;
-      if (!data) {
-        if (failures < 3) return null;
-        return h('div', { className: 'orCapsule', title: '宿主没有注册 /opencode-route/status' },
+      if (!current) {
+        if (failures >= 3) {
+          return h('div', { className: 'orCapsule', title: '宿主没有注册 /opencode-route/status' },
+            h('span', { className: 'orDot off' }),
+            h('span', { className: 'orLabel' }, h('span', { className: 'orNum text' }, '未就绪')));
+        }
+        // Same box, same height: only the content fills in.
+        return h('div', { className: 'orCapsule', 'aria-hidden': 'true' },
           h('span', { className: 'orDot off' }),
-          h('span', { className: 'orLabel' }, h('span', { className: 'orNum text' }, '未就绪')));
+          h('span', { className: 'orLabel' }, h('span', { className: 'orNum' }, h('span', { className: 'orSkel' }))));
       }
-      if (!data.enabled) return null;
+      if (!current.enabled) return null;
 
-      const arm = typeof data.arm === 'string' ? data.arm : 'off';
+      const arm = typeof current.arm === 'string' ? current.arm : 'off';
       const control = arm === 'control';
       // A single request is a noisy reading: bursts inflate it and a slow tool
       // step deflates it. The badge shows the median of the last three usable
       // requests (window >= 500 ms, at least 60 output tokens) so the number
       // moves only when the session's speed actually changes.
-      const recentTurns = Array.isArray(data.turns) ? data.turns : [];
+      const recentTurns = Array.isArray(current.turns) ? current.turns : [];
       const usable = (row) => typeof row.tps === 'number' && row.tps > 0 && row.tps <= 1000
         && (row.decodeMs === null || row.decodeMs === undefined || row.decodeMs >= 500)
         && (row.out === null || row.out === undefined || row.out >= 60);
@@ -231,15 +256,15 @@ window.__ModuleLoader__.load({
       const median = sample.length ? sample[Math.floor((sample.length - 1) / 2)] : null;
       // Same definition as DSH's composer footer: total output over total decode
       // across the session, so one buffered burst cannot move it.
-      const rate = data.rate && typeof data.rate.tps === 'number' && data.rate.tps > 0 ? data.rate.tps : null;
+      const rate = current.rate && typeof current.rate.tps === 'number' && current.rate.tps > 0 ? current.rate.tps : null;
       const tps = rate ?? median;
-      const probing = data.state === 'probing';
+      const probing = current.state === 'probing';
       let dot = 'off';
       let textLabel = null;
       if (probing) { dot = 'busy'; textLabel = '挑选中…'; }
       else if (control) { dot = 'off'; textLabel = '对照组'; }
       else if (tps !== null) { dot = tps >= 150 ? 'fast' : 'slow'; }
-      else if (data.state === 'pinned' || data.state === 'locked') textLabel = '已选路';
+      else if (current.state === 'pinned' || current.state === 'locked') textLabel = '已选路';
       else textLabel = '待选';
 
       // The hover panel is just the table: the chip already carries the state,
@@ -280,7 +305,7 @@ window.__ModuleLoader__.load({
         ? '实验对照组，不参与选路'
         : probing
           ? '正在挑选路由'
-          : data.state === 'locked'
+          : current.state === 'locked'
             ? '路由已锁定'
             : tps !== null ? `当前 ${formatSpeed(tps)} tok/s` : '还没有足够长的样本';
       return h(React.Fragment, null,
@@ -294,7 +319,7 @@ window.__ModuleLoader__.load({
           onMouseLeave: scheduleHide,
         },
           h('span', { className: `orDot ${dot}`, 'aria-hidden': 'true' }),
-          data.experiment && data.experiment.enabled
+          current.experiment && current.experiment.enabled
             ? h('span', {
               className: 'orTag',
               title: control ? 'A/B 实验：对照组' : 'A/B 实验：处理组',

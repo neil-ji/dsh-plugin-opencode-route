@@ -223,6 +223,13 @@ export function apply(ctx, config = {}) {
 
   let resolvePinsReady;
   const pinsReady = new Promise((resolve) => { resolvePinsReady = resolve; });
+  // A status call can arrive before the pin/log restore finishes; answering then
+  // would report "idle" and flip to "pinned" a moment later. Wait for the store,
+  // bounded so a broken one cannot hang the endpoint.
+  const statusReady = Promise.race([
+    pinsReady,
+    new Promise((resolve) => { const timer = setTimeout(resolve, 2000); timer?.unref?.(); }),
+  ]);
   void (async () => {
     try {
       if (cacheCfg.persistPins) {
@@ -946,7 +953,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.7.7',
+    version: '1.7.8',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     subagentMode: cfg.subagents.mode,
@@ -964,13 +971,14 @@ export function apply(ctx, config = {}) {
     webCtx.effect(() => server.register({
       kind: 'exact',
       path: '/opencode-route/status',
-      handler: (req, res) => {
+      handler: async (req, res) => {
         try {
           if (req.method !== 'GET' && req.method !== 'HEAD') {
             res.writeHead(405, { allow: 'GET, HEAD' });
             res.end();
             return;
           }
+          await statusReady;
           const url = new URL(String(req.url ?? '/'), 'http://localhost');
           const sessionId = url.searchParams.get('session') ?? undefined;
           res.writeHead(200, {
