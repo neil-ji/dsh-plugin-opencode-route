@@ -22,7 +22,8 @@ a shared pool (sub-agent sessions lease from the same pool), and pins it by over
   on 18 days of local data — see `research/README.md`.
 - **Never moves a session on its own.** Changing the id throws away the provider-side prompt cache,
   so a session is pinned once and keeps that route. After 2 turns or 20k tokens it is cache-locked:
-  slow turns are logged, not re-routed.
+  slow turns are logged, not re-routed. A session's *first* request is always allowed to probe, however
+  large its prompt: there is no cache to lose before the provider has served that session.
 - **Corrects a bad estimate once.** A short probe can read ~2× faster than the real request. If the
   first real turn lands below 60% of the probe's number, the route is dropped and re-picked while the
   context is still cheap.
@@ -171,6 +172,7 @@ DSH 插件在会话第一次调用模型前探测若干候选 id，从共享池�
 
 换道会丢一次 prompt 缓存，所以策略是**一次会话只选一次道、之后不主动换**：满 2 轮或上下文
 ≥ 20k token 后进入缓存锁定，慢只记录不换道；只有 429/超时才换。探针高估时允许一次纠偏。
+例外是**会话的第一次请求**：无论 prompt 多大都允许探测一次，因为那时提供方还没有这个会话的缓存可丢。
 
 UI 上是一个会话标题栏徽标：`● 170 tok/s`，只读；悬停出详情浮层（不占布局）。选路全自动，没有手动换路入口。
 

@@ -615,9 +615,14 @@ export function apply(ctx, config = {}) {
     const key = pairKey(provider, sessionId);
     const baseline = baselines.get(key);
     const liveTokens = contextTokens(sessionId);
-    const locked = (baseline !== undefined
-      && (baseline.n >= cacheCfg.lockAfterTurns || (baseline.lastInput ?? 0) >= cacheCfg.lockAfterInputTokens))
-      || liveTokens >= cacheCfg.lockAfterInputTokens;
+    // A session's first request has no prompt cache on the provider side yet,
+    // whatever the prompt size, so switching routes costs nothing there. Only a
+    // session that already called the model has a cache worth protecting.
+    const hasHistory = baseline !== undefined && (baseline.n ?? 0) > 0;
+    const locked = hasHistory
+      && (baseline.n >= cacheCfg.lockAfterTurns
+        || (baseline.lastInput ?? 0) >= cacheCfg.lockAfterInputTokens
+        || liveTokens >= cacheCfg.lockAfterInputTokens);
     if (locked) {
       log({
         kind: 'skip-pin', provider, model, sessionId, reason: 'cache-locked',
@@ -812,24 +817,9 @@ export function apply(ctx, config = {}) {
       const cacheReadTokens = usage?.cacheReadTokens ?? 0;
       const cacheBase = inputTokens + cacheReadTokens;
       const cacheHit = cacheBase > 0 ? cacheReadTokens / cacheBase : null;
-      log({
-        kind: 'turn',
-        provider,
-        model,
-        sessionId,
-        arm,
-        pinnedId: pinnedId ?? null,
-        shape,
-        out,
-        tps: tps === null ? null : Math.round(tps),
-        decodeMs: genMs > 0 ? Math.round(genMs) : null,
-        ttfbMs,
-        inputTokens,
-        cacheReadTokens,
-        cacheHit: cacheHit === null ? null : Math.round(cacheHit * 100),
-        finish: kind,
-        failure: reason?.failure?.code ?? null,
-      });
+      // Update the baseline first so the turn can record whether the session is
+      // locked: the analyzer needs to separate "treatment that was actually
+      // routed" from "treatment that was already cache-locked".
       let locked = false;
       if (sessionId !== undefined) {
         const key = pairKey(provider, sessionId);
@@ -851,6 +841,25 @@ export function apply(ctx, config = {}) {
         capMap(baselines);
         locked = next.n >= cacheCfg.lockAfterTurns || next.lastInput >= cacheCfg.lockAfterInputTokens;
       }
+      log({
+        kind: 'turn',
+        provider,
+        model,
+        sessionId,
+        arm,
+        pinnedId: pinnedId ?? null,
+        locked,
+        shape,
+        out,
+        tps: tps === null ? null : Math.round(tps),
+        decodeMs: genMs > 0 ? Math.round(genMs) : null,
+        ttfbMs,
+        inputTokens,
+        cacheReadTokens,
+        cacheHit: cacheHit === null ? null : Math.round(cacheHit * 100),
+        finish: kind,
+        failure: reason?.failure?.code ?? null,
+      });
       if (pinnedId !== undefined) {
         if (kind === 'error' || kind === 'thrown') noteFailure(pinnedId, reason?.failure?.code, provider, model);
         else if (tps !== null) noteSuccess(pinnedId, tps, shape, provider, model, ttfbMs, locked);
@@ -1028,7 +1037,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.7.9',
+    version: '1.8.0',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     subagentMode: cfg.subagents.mode,

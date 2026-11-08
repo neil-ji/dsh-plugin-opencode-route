@@ -126,41 +126,64 @@ console.log(`# ${turns.length} turn events · ${sessions.length} sessions with >
 if (cutoff !== null) {
   console.log(`# 实验起点 ${new Date(cutoff).toISOString()} · 排除实验前已有会话 ${droppedForCutoff} 个`);
 }
+// A treatment session only counts as treated if the picker actually ran on it:
+// a session that was already cache-locked keeps its natural route, so counting
+// it as treatment dilutes the effect.
+const routed = new Set(events
+  .filter((e) => ['probe', 'probe-reject', 'probe-dead', 'pin', 'keep-natural'].includes(e.kind) && typeof e.sessionId === 'string')
+  .map((e) => e.sessionId));
+const treated = groups.treatment.filter((s) => routed.has(s.session));
+const untouched = groups.treatment.length - treated.length;
+
 console.log('');
 report('treatment', groups.treatment);
+report('treated', treated);
 report('control', groups.control);
 
 // Day-stratified bootstrap: resample sessions inside each day, so the arm
 // comparison is made within the same days and daily gateway drift cancels.
-const days = [...new Set(sessions.map((s) => s.day))].sort();
 const pick = (list, n) => Array.from({ length: n }, () => list[Math.floor(Math.random() * list.length)]);
-const dayIndex = new Map(days.map((d) => [d, {
-  treatment: groups.treatment.filter((s) => s.day === d),
-  control: groups.control.filter((s) => s.day === d),
-}]));
-
-const ratios = [];
-const gains = [];
-for (let i = 0; i < BOOT; i += 1) {
-  const a = [];
-  const b = [];
-  for (const d of days) {
-    const cell = dayIndex.get(d);
-    if (cell.treatment.length) a.push(...pick(cell.treatment, cell.treatment.length));
-    if (cell.control.length) b.push(...pick(cell.control, cell.control.length));
+function compareArms(aList, bList) {
+  const days = [...new Set([...aList, ...bList].map((s) => s.day))].sort();
+  const index = new Map(days.map((d) => [d, {
+    a: aList.filter((s) => s.day === d),
+    b: bList.filter((s) => s.day === d),
+  }]));
+  const ratios = [];
+  const gains = [];
+  for (let i = 0; i < BOOT; i += 1) {
+    const a = [];
+    const b = [];
+    for (const d of days) {
+      const cell = index.get(d);
+      if (cell.a.length) a.push(...pick(cell.a, cell.a.length));
+      if (cell.b.length) b.push(...pick(cell.b, cell.b.length));
+    }
+    if (!a.length || !b.length) continue;
+    ratios.push(med(a.map((s) => s.tps)) / med(b.map((s) => s.tps)));
+    gains.push(Math.exp(mean(a.map((s) => Math.log(s.tps))) - mean(b.map((s) => Math.log(s.tps)))));
   }
-  if (!a.length || !b.length) continue;
-  ratios.push(med(a.map((s) => s.tps)) / med(b.map((s) => s.tps)));
-  gains.push(Math.exp(mean(a.map((s) => Math.log(s.tps))) - mean(b.map((s) => Math.log(s.tps)))));
+  ratios.sort((x, y) => x - y);
+  gains.sort((x, y) => x - y);
+  return {
+    point: med(aList.map((s) => s.tps)) / med(bList.map((s) => s.tps)),
+    lo: q(ratios, 0.025),
+    hi: q(ratios, 0.975),
+    gain: gains.length ? med(gains) : null,
+    gainLo: q(gains, 0.025),
+    gainHi: q(gains, 0.975),
+    B: ratios.length,
+  };
 }
-ratios.sort((x, y) => x - y);
-gains.sort((x, y) => x - y);
 
-const lo = q(ratios, 0.025);
-const hi = q(ratios, 0.975);
-const point = med(groups.treatment.map((s) => s.tps)) / med(groups.control.map((s) => s.tps));
-console.log(`\n会话级中位 tps 比值 treatment/control = ${n2(point)}x  (day-stratified bootstrap 95% CI ${n2(lo)}–${n2(hi)}x, B=${ratios.length})`);
-console.log(`log-mean 比值 = ${n2(med(gains))}x  (95% CI ${n2(q(gains, 0.025))}–${n2(q(gains, 0.975))}x)`);
+const itt = compareArms(groups.treatment, groups.control);
+console.log(`\n会话级中位 tps 比值 treatment/control = ${n2(itt.point)}x  (day-stratified bootstrap 95% CI ${n2(itt.lo)}–${n2(itt.hi)}x, B=${itt.B})`);
+console.log(`log-mean 比值 = ${n2(itt.gain)}x  (95% CI ${n2(itt.gainLo)}–${n2(itt.gainHi)}x)`);
+if (treated.length > 0) {
+  const pp = compareArms(treated, groups.control);
+  console.log(`per-protocol（仅实际跑过选路的 ${treated.length} 个处理组会话）= ${n2(pp.point)}x  (95% CI ${n2(pp.lo)}–${n2(pp.hi)}x)`);
+  console.log(`处理组中未实际处理的会话 ${untouched} 个（cache-locked，等价于对照）`);
+}
 
 // Integrity: a control session must never have produced probe traffic.
 const probeSessions = new Set(events.filter((e) => e.kind === 'probe' || e.kind === 'probe-reject' || e.kind === 'probe-dead').map((e) => e.sessionId).filter(Boolean));
@@ -173,12 +196,13 @@ if (violations.length) console.log(`  ${violations.slice(0, 5).join(', ')}…`);
 console.log('\n## 判读');
 if (groups.treatment.length < 20 || groups.control.length < 20) {
   console.log(`样本不足（${groups.treatment.length}/${groups.control.length} 会话），判读无效；先跑到 ≥20 会话/臂。`);
-} else if (lo > 1.05) {
-  console.log(`有效：CI 下界 ${n2(lo)}x > 1.05，且该方向与探测逻辑一致。`);
-} else if (hi < 1) {
-  console.log(`负向：CI 上界 ${n2(hi)}x < 1，选道在拖慢会话；检查 SHAPE_RANK 与缓存代价。`);
+} else if (itt.lo > 1.05) {
+  console.log(`有效：CI 下界 ${n2(itt.lo)}x > 1.05，且该方向与探测逻辑一致。`);
+  if (treated.length > 0) console.log('per-protocol 口径见上：若它明显高于 ITT，说明效应集中在真正被选路的会话上。');
+} else if (itt.hi < 1) {
+  console.log(`负向：CI 上界 ${n2(itt.hi)}x < 1，选道在拖慢会话；检查 SHAPE_RANK 与缓存代价。`);
 } else {
-  console.log(`无法证明：CI ${n2(lo)}–${n2(hi)}x 跨 1。按实测效应量补样${groups.treatment.length < 60 ? '（目标 ≥60 会话/臂）' : ''}，或判定"当前数据不支持"。`);
+  console.log(`无法证明：CI ${n2(itt.lo)}–${n2(itt.hi)}x 跨 1。按实测效应量补样（目标 ≥20 会话/臂可判读），或判定"当前数据不支持"。`);
 }
 
 if (args.get('baseline')) {
