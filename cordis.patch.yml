@@ -32,3 +32,9 @@
           lockAfterTurns: 2
           lockAfterInputTokens: 20000
           persistPins: true
+        # A/B for measuring the route effect; off = ordinary picker behaviour.
+        # Turn both arms on for 1-2 weeks, then run research/analyze_ab.mjs.
+        experiment:
+          enabled: false
+          armRatio: 0.5
+          salt: route-v1

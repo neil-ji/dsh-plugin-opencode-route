@@ -18,7 +18,7 @@
 // provider resolves its own key.
 
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -62,6 +62,16 @@ const DEFAULTS = {
   },
   subagents: {
     mode: 'pool',       // pool | own
+  },
+  experiment: {
+    // A/B for measuring the route effect. A session is assigned by a stable hash
+    // of its id, so it never crosses arms: `treatment` probes and pins, `control`
+    // does neither (no probe traffic, no header override), and both log `turn`
+    // events carrying `arm`. Off by default: `arm` stays "off" and behaviour is
+    // exactly the ordinary picker.
+    enabled: false,
+    armRatio: 0.5,      // share of sessions assigned to `treatment`
+    salt: 'route-v1',   // fixed for one experiment; changing it reshuffles arms
   },
 };
 
@@ -110,6 +120,7 @@ export function apply(ctx, config = {}) {
   const poolCfg = cfg.pool;
   const probeCfg = cfg.probe;
   const cacheCfg = cfg.cache;
+  const expCfg = cfg.experiment;
 
   /** @type {Map<string, {id: string, model: string, at: number, provider: string}>} */
   const pins = new Map();
@@ -185,6 +196,14 @@ export function apply(ctx, config = {}) {
     && Array.isArray(cfg.providers) && cfg.providers.includes(provider)
     && (cfg.models.length === 0 || cfg.models.includes(model));
 
+  // A session's arm is a pure function of its id: deterministic across restarts
+  // and independent of request order, so a session cannot drift between arms.
+  function armOf(sessionId) {
+    if (!expCfg?.enabled) return 'off';
+    const digest = createHash('sha256').update(`${expCfg.salt}:${String(sessionId)}`).digest();
+    return digest.readUInt32BE(0) / 2 ** 32 < expCfg.armRatio ? 'treatment' : 'control';
+  }
+
   function log(record) {
     const row = { ts: new Date().toISOString(), ...record };
     recent.push(row);
@@ -216,10 +235,13 @@ export function apply(ctx, config = {}) {
       const loadA = a.leasedTo.size - (a.leasedTo.has(sessionId) ? 1 : 0);
       const loadB = b.leasedTo.size - (b.leasedTo.has(sessionId) ? 1 : 0);
       if (loadA !== loadB) return loadA - loadB;
-      const shapeA = SHAPE_RANK[a.shape] ?? 9;
-      const shapeB = SHAPE_RANK[b.shape] ?? 9;
-      if (shapeA !== shapeB) return shapeA - shapeB;
-      return b.tps - a.tps;
+      const scoreA = entryScore(a);
+      const scoreB = entryScore(b);
+      if (scoreA !== scoreB) return scoreB - scoreA;
+      const ttfbA = a.ttfbMs ?? Infinity;
+      const ttfbB = b.ttfbMs ?? Infinity;
+      if (ttfbA !== ttfbB) return ttfbA - ttfbB;
+      return (SHAPE_RANK[a.shape] ?? 9) - (SHAPE_RANK[b.shape] ?? 9);
     })[0];
   }
 
@@ -233,10 +255,26 @@ export function apply(ctx, config = {}) {
       const kept = entries.filter((entry) => entry.id !== id);
       if (kept.length !== entries.length) { pool.set(poolKey, kept); removed = true; }
     }
-    for (const [pinKey, pin] of pins) if (pin.id === id) pins.delete(pinKey);
+    // A shared route is leased by several sessions, so one failure can drop the
+    // pins of sessions that did nothing wrong. Keep the list in the event log:
+    // the A/B analysis needs to know how often that diluted the treatment arm.
+    const unpinned = [];
+    for (const [pinKey, pin] of pins.entries()) {
+      if (pin.id !== id) continue;
+      unpinned.push(pinKey.slice(pinKey.indexOf('\u0000') + 1));
+      pins.delete(pinKey);
+    }
     savePins();
     if (removed) counters.evictions += 1;
-    if (removed) log({ kind: 'evict', id, reason });
+    if (removed || unpinned.length > 0) {
+      log({
+        kind: 'evict',
+        id,
+        reason,
+        unpinnedSessions: unpinned.length,
+        unpinned: unpinned.slice(0, 20),
+      });
+    }
   }
 
   async function probeOne(provider, model, candidateId) {
@@ -295,14 +333,38 @@ export function apply(ctx, config = {}) {
     };
   }
 
+  // A probe that delivered its tokens in under 500 ms cannot be measured
+  // reliably, but it did move that many tokens inside that window, so
+  // out * 1000 / 500 is a burst-proof lower bound. Ranking uses this score;
+  // the response id's shape is only a last-resort tie-break. The shape used to
+  // be the primary key (`gw` first, often without a measurement); 18 days of
+  // local data showed `gw` was the slowest of the four common shapes, so that
+  // preference is gone (see research/README.md).
+  const NOMINAL_WINDOW_MS = 500;
+
+  function lowerBoundTps(result) {
+    return (result.out * 1000) / NOMINAL_WINDOW_MS;
+  }
+
+  function scoreOf(result) {
+    return result.measured === true && typeof result.tps === 'number' ? result.tps : lowerBoundTps(result);
+  }
+
+  function entryScore(entry) {
+    return typeof entry.tps === 'number' && entry.tps > 0 ? entry.tps : (entry.lowerTps ?? 0);
+  }
+
   // A candidate is only worth pinning when it looks good on its own merits; when
   // every candidate is on a saturated upstream, pinning nothing is the safe move.
+  // A window too short to measure is admitted on liveness alone (there is no
+  // evidence it is bad) but still ranks by its conservative lower bound, so it
+  // only wins when it can prove it is faster.
   function admittable(result) {
     if (!result.alive) return false;
     if (result.ttfbMs === null || result.ttfbMs > probeCfg.ttfbMaxMs) return false;
     if (result.totalMs > probeCfg.totalMaxMs) return false;
-    if (result.shape === 'gw') return true;
-    return result.measured === true && result.tps !== null && result.tps >= thresholds.degradeTps;
+    if (result.measured !== true) return result.out >= 24;
+    return result.tps !== null && result.tps >= thresholds.degradeTps;
   }
 
   async function probeRound(provider, model, sessionId) {
@@ -339,32 +401,39 @@ export function apply(ctx, config = {}) {
         const ok = admittable(result);
         log({
           kind: ok ? 'probe' : 'probe-reject',
-          provider, model, id: candidateId, natural: candidateId === sessionId, shape: result.shape,
+          provider, model, sessionId, id: candidateId, natural: candidateId === sessionId, shape: result.shape,
           tps: result.tps === null ? null : Math.round(result.tps),
           ttfbMs: result.ttfbMs, totalMs: result.totalMs, measured: result.measured,
         });
         if (ok) {
           alive.push(result);
-          if (result.shape === 'gw' && result.ttfbMs <= probeCfg.ttfbMaxMs) break;
-          if (result.measured && result.tps >= thresholds.targetTps) break;
+          // One rule for every shape: stop when this candidate already reaches
+          // the target. A slow `gw` no longer ends the search early.
+          if (scoreOf(result) >= thresholds.targetTps) break;
         }
       } else {
-        log({ kind: 'probe-dead', provider, model, id: candidateId, natural: candidateId === sessionId, reason: result.reason });
+        log({ kind: 'probe-dead', provider, model, sessionId, id: candidateId, natural: candidateId === sessionId, reason: result.reason });
       }
     }
     const now = Date.now();
     const entries = alive
       .sort((a, b) => {
-        const rank = (SHAPE_RANK[a.shape] ?? 9) - (SHAPE_RANK[b.shape] ?? 9);
-        if (rank !== 0) return rank;
-        const tpsA = a.tps ?? 0;
-        const tpsB = b.tps ?? 0;
-        return tpsB - tpsA;
+        const scoreA = scoreOf(a);
+        const scoreB = scoreOf(b);
+        if (scoreA !== scoreB) return scoreB - scoreA;
+        const ttfbA = a.ttfbMs ?? Infinity;
+        const ttfbB = b.ttfbMs ?? Infinity;
+        if (ttfbA !== ttfbB) return ttfbA - ttfbB;
+        return (SHAPE_RANK[a.shape] ?? 9) - (SHAPE_RANK[b.shape] ?? 9);
       })
       .slice(0, poolCfg.size)
       .map((result) => ({
         id: result.id,
         tps: result.tps ?? 0,
+        // Zero when the probe was measurable; otherwise the conservative lower
+        // bound that ranked it, so the pool keeps a usable speed after a restart
+        // of the round without pretending it is a measurement.
+        lowerTps: result.measured === true ? 0 : Math.round(lowerBoundTps(result)),
         shape: result.shape,
         probedAt: now,
         lastOkAt: now,
@@ -378,7 +447,7 @@ export function apply(ctx, config = {}) {
     } else {
       negativeUntil.set(poolKey, now + poolCfg.negativeTtlMs);
     }
-    log({ kind: 'probe-round', provider, model, alive: entries.length, ids: entries.map((entry) => entry.id) });
+    log({ kind: 'probe-round', provider, model, sessionId, alive: entries.length, ids: entries.map((entry) => entry.id) });
   }
 
   async function ensurePool(poolKey, provider, model, sessionId) {
@@ -407,25 +476,21 @@ export function apply(ctx, config = {}) {
   // Probe results are optimistic: a 64-token burst can look 2x faster than the
   // real request. A misestimate is corrected once, while the context is cheap.
   const repinAllowance = new Map();
-  const forceRepin = new Set();
   const inflightPins = new Map();
 
   async function ensurePin(provider, model, sessionId, signal) {
+    if (armOf(sessionId) === 'control') return undefined;
     const key = pairKey(provider, sessionId);
     await pinsReady;
     const existing = pins.get(key);
     const kept = naturalKeep.get(key);
-    if (kept !== undefined && Date.now() - kept.at < 600000 && !forceRepin.has(key)) return undefined;
-    if (forceRepin.has(key)) naturalKeep.delete(key);
+    if (kept !== undefined && Date.now() - kept.at < 600000) return undefined;
     // A session keeps its route for as long as it lives: every switch costs one
     // full re-prefill of the whole context, which is the expensive thing here.
-    if (existing !== undefined && existing.model === model && !forceRepin.has(key)) return existing.id;
-    if (forceRepin.has(key)) forceRepin.delete(key);
-    if (existing !== undefined) {
-      // An explicit `/route repin` keeps the old id out of the pool so the round
-      // cannot hand the same route back.
-      invalidateId(existing.id, 'forced-repin');
-    }
+    if (existing !== undefined && existing.model === model) return existing.id;
+    // A model switch is the only thing that moves a pinned session on its own;
+    // otherwise the picker is fully automatic (there is no manual re-pick).
+    if (existing !== undefined) invalidateId(existing.id, 'model-changed');
     const running = inflightPins.get(key);
     if (running !== undefined) return running;
     const work = ensurePinWork(provider, model, sessionId, signal).finally(() => inflightPins.delete(key));
@@ -433,14 +498,14 @@ export function apply(ctx, config = {}) {
     return work;
   }
 
-  async function ensurePinWork(provider, model, sessionId, signal, force = false) {
+  async function ensurePinWork(provider, model, sessionId, signal) {
     const key = pairKey(provider, sessionId);
     const baseline = baselines.get(key);
     const liveTokens = contextTokens(sessionId);
     const locked = (baseline !== undefined
       && (baseline.n >= cacheCfg.lockAfterTurns || (baseline.lastInput ?? 0) >= cacheCfg.lockAfterInputTokens))
       || liveTokens >= cacheCfg.lockAfterInputTokens;
-    if (locked && !force) {
+    if (locked) {
       log({
         kind: 'skip-pin', provider, model, sessionId, reason: 'cache-locked',
         turns: baseline?.n ?? 0, lastInput: baseline?.lastInput ?? 0, liveTokens,
@@ -575,8 +640,9 @@ export function apply(ctx, config = {}) {
     const provider = options.provider;
     const model = options.model;
     const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId);
+    const arm = sessionId === undefined ? 'off' : armOf(sessionId);
     let pinnedId;
-    if (sessionId !== undefined && !cfg.dryRun) {
+    if (sessionId !== undefined && !cfg.dryRun && arm !== 'control') {
       try {
         pinnedId = await ensurePin(provider, model, sessionId, options.signal);
       } catch { pinnedId = undefined; }
@@ -614,7 +680,11 @@ export function apply(ctx, config = {}) {
       const shape = shapeOf(responseId);
       const out = usage?.outputTokens ?? 0;
       const genMs = first !== null && last !== null ? last - first : 0;
-      const tps = genMs > 0 && out > 0 ? (out * 1000) / genMs : null;
+      // A short window is a delivery burst, not a generation rate: 47 tokens in
+      // 7 ms is not 6,700 tok/s. Keep the raw window in decodeMs/out for
+      // diagnostics, but publish a rate only when it can mean something.
+      const measurable = genMs >= 500 && out >= 60;
+      const tps = measurable ? (out * 1000) / genMs : null;
       const kind = reason?.kind ?? (failed !== undefined ? 'thrown' : 'none');
       const ttfbMs = first === null ? null : Math.round(first - t0);
       const inputTokens = usage?.inputTokens ?? 0;
@@ -626,10 +696,12 @@ export function apply(ctx, config = {}) {
         provider,
         model,
         sessionId,
+        arm,
         pinnedId: pinnedId ?? null,
         shape,
         out,
         tps: tps === null ? null : Math.round(tps),
+        decodeMs: genMs > 0 ? Math.round(genMs) : null,
         ttfbMs,
         inputTokens,
         cacheReadTokens,
@@ -685,7 +757,7 @@ export function apply(ctx, config = {}) {
         if (early && allowed && probeTps >= 100 && tps < probeTps * 0.6 && tps < thresholds.targetTps) {
           repinAllowance.set(key, 1);
           log({
-            kind: 'repin', provider, model, sessionId, id: pinnedId,
+            kind: 'corrective-repin', provider, model, sessionId, id: pinnedId,
             reason: 'probe-overestimated', probeTps: Math.round(probeTps), realTps: Math.round(tps),
           });
           invalidateId(pinnedId, `misestimate:probe${Math.round(probeTps)}-real${Math.round(tps)}`);
@@ -709,6 +781,9 @@ export function apply(ctx, config = {}) {
       if (cfg.dryRun || !cfg.enabled) return out;
       if (!isScope(request.provider, request.model)) return out;
       if (request.sessionId === undefined) return out;
+      // A control session never receives a pin, even if one survived from an
+      // earlier run with the experiment disabled.
+      if (armOf(request.sessionId) === 'control') return out;
       const pin = pins.get(pairKey(request.provider, request.sessionId));
       if (pin !== undefined && !out.has('x-opencode-session')) out.set('x-opencode-session', pin.id);
     } catch { /* never break header preparation */ }
@@ -759,6 +834,8 @@ export function apply(ctx, config = {}) {
         ts: row.ts,
         shape: row.shape,
         tps: row.tps,
+        decodeMs: row.decodeMs ?? null,
+        out: row.out ?? 0,
         ttfbMs: row.ttfbMs,
         cacheHit: row.cacheHit,
         finish: row.finish,
@@ -776,6 +853,7 @@ export function apply(ctx, config = {}) {
           provider, model,
           shape: entry.shape,
           tps: Math.round(entry.tps),
+          lowerTps: entry.lowerTps ?? 0,
           leased: entry.leasedTo.size,
           strikes: entry.strikes,
         });
@@ -783,11 +861,13 @@ export function apply(ctx, config = {}) {
     }
     const last = turns[turns.length - 1];
     let best = 0;
-    for (const row of poolRows) best = Math.max(best, row.tps);
+    for (const row of poolRows) best = Math.max(best, row.tps, row.lowerTps);
     return {
       ts: new Date().toISOString(),
       enabled: cfg.enabled,
       dryRun: cfg.dryRun,
+      arm: sessionId === undefined ? 'off' : armOf(String(sessionId)),
+      experiment: { enabled: expCfg?.enabled === true, armRatio: expCfg?.armRatio ?? null },
       state: probeState.active ? 'probing' : (pin !== undefined ? 'pinned' : (locked ? 'locked' : 'idle')),
       locked,
       probe: probeState,
@@ -802,34 +882,13 @@ export function apply(ctx, config = {}) {
     };
   }
 
-  async function repinNow(sessionId) {
-    const lastTurn = [...recent].reverse().find((row) => row.kind === 'turn' && row.sessionId === sessionId);
-    let restored;
-    for (const [key, pin] of pins) if (key.endsWith(`\u0000${sessionId}`)) restored = pin;
-    const provider = lastTurn?.provider ?? restored?.provider ?? cfg.providers[0];
-    const model = lastTurn?.model ?? restored?.model;
-    if (model === undefined || model.length === 0) return { ok: false, error: '这个会话还没发过请求，先发一条消息再来选道。' };
-    const key = pairKey(provider, sessionId);
-    naturalKeep.delete(key);
-    const old = pins.get(key);
-    if (old !== undefined) invalidateId(old.id, 'repin-now');
-    const poolKey = poolKeyOf(provider, model);
-    pool.delete(poolKey);
-    negativeUntil.delete(poolKey);
-    const id = await ensurePinWork(provider, model, sessionId, undefined, true);
-    if (id === undefined) return { ok: false, error: '这次没有找到可用路由（候选全被拒），已保持原状。' };
-    const pin = pins.get(key);
-    const entry = (pool.get(poolKey) ?? []).find((row) => row.id === id);
-    log({ kind: 'repin-now', provider, model, sessionId, id });
-    return { ok: true, id, shape: entry?.shape ?? null, tps: Math.round(pin?.probeTps ?? 0) };
-  }
-
   log({
     kind: 'plugin',
-    version: '1.7.2',
+    version: '1.7.6',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     subagentMode: cfg.subagents.mode,
+    experiment: expCfg?.enabled ? { armRatio: expCfg.armRatio, salt: expCfg.salt } : null,
     cache: cfg.cache,
     logDir,
   });
@@ -840,35 +899,6 @@ export function apply(ctx, config = {}) {
   // the registrations for the whole process lifetime.
   ctx.inject(['webServer'], (webCtx) => {
     const server = webCtx.webServer;
-    webCtx.effect(() => server.register({
-      kind: 'exact',
-      path: '/opencode-route/repin',
-      handler: async (req, res) => {
-        try {
-          if (req.method !== 'POST') {
-            res.writeHead(405, { allow: 'POST' });
-            res.end();
-            return;
-          }
-          const url = new URL(String(req.url ?? '/'), 'http://localhost');
-          const sessionId = url.searchParams.get('session');
-          if (sessionId === null || sessionId.length === 0) {
-            res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ ok: false, error: 'missing session' }));
-            return;
-          }
-          const result = await repinNow(sessionId);
-          res.writeHead(result.ok ? 200 : 409, {
-            'content-type': 'application/json; charset=utf-8',
-            'cache-control': 'no-store',
-          });
-          res.end(JSON.stringify(result));
-        } catch (error) {
-          res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: false, error: error?.message ?? 'repin failed' }));
-        }
-      },
-    }), 'opencode-route: POST /opencode-route/repin');
     webCtx.effect(() => server.register({
       kind: 'exact',
       path: '/opencode-route/status',
@@ -901,25 +931,16 @@ export function apply(ctx, config = {}) {
     cmdCtx.effect(() => cmdCtx.commands.register({
       name: 'route',
       description: 'Show OpenCode Go route pins, the lease pool, and recent speeds',
-      handler: (invocation) => {
+      handler: async (invocation) => {
         const raw = String(invocation?.rawInput ?? '').trim().toLowerCase();
         if (raw === 'stats' || raw === '效果' || raw === '验证') {
           const s = summarizeCompare();
           const lines = [
-            `选道决策 ${s.decisions} 次：保留原生 ${s.keptNatural} 次，换道 ${s.switched} 次`,
-            `换道场次里：原生中位 ${s.medianNaturalWhenSwitched} tok/s → 选中中位 ${s.medianChosenWhenSwitched} tok/s，中位提升 ${s.medianGain}×`,
+            `选路 ${s.decisions} 次：保留原路由 ${s.keptNatural} 次，换路 ${s.switched} 次`,
+            `换路的会话里：原路由中位 ${s.medianNaturalWhenSwitched} tok/s → 现在中位 ${s.medianChosenWhenSwitched} tok/s，中位提升 ${s.medianGain}×`,
             `其中明显变快 ${s.improved} 次，明显变慢 ${s.worse} 次`,
           ];
           return { kind: 'success', text: lines.join('\n') };
-        }
-        if (raw === 'repin' || raw === 'repick') {
-          const sessionId = invocation?.agent?.session?.id;
-          if (sessionId === undefined) return { kind: 'error', text: '没有活动会话，无法重新选道。' };
-          for (const provider of cfg.providers) forceRepin.add(pairKey(provider, String(sessionId)));
-          return {
-            kind: 'success',
-            text: '已标记重新选道：下一次模型请求会重新探测候选，并换到新路由。\n代价是该请求要重新 prefill 整个上下文（缓存失效一次）。',
-          };
         }
         const lines = [];
         lines.push(`opencode-route: ${cfg.enabled ? 'on' : 'off'}${cfg.dryRun ? ' (dry run)' : ''} · providers ${cfg.providers.join(',')}`);
@@ -929,7 +950,8 @@ export function apply(ctx, config = {}) {
           if (entries.length === 0) continue;
           lines.push(`${provider}/${model}:`);
           for (const entry of entries) {
-            lines.push(`  ${entry.id.slice(0, 18)}… ${entry.shape} ${Math.round(entry.tps)} tok/s · leased ${entry.leasedTo.size} · strikes ${entry.strikes}`);
+            const speed = entry.tps > 0 ? String(Math.round(entry.tps)) : `~${entry.lowerTps ?? 0}`;
+            lines.push(`  ${entry.id.slice(0, 18)}… ${speed} tok/s · ${entry.leasedTo.size} 个会话在用`);
           }
         }
         const pinRows = [...pins.entries()].slice(-8).map(([key, pin]) => `  ${key.split('\u0000')[1].slice(0, 14)}… -> ${pin.id.slice(0, 18)}…`);
@@ -937,7 +959,7 @@ export function apply(ctx, config = {}) {
         const turns = recent.filter((row) => row.kind === 'turn').slice(-6);
         if (turns.length > 0) {
           lines.push('recent:');
-          for (const row of turns) lines.push(`  ${row.sessionId?.slice(0, 12) ?? '?'} ${row.shape} ${row.tps ?? '-'} tok/s ttfb ${row.ttfbMs ?? '-'}ms hit ${row.cacheHit ?? '-'}% ${row.finish}`);
+          for (const row of turns) lines.push(`  ${row.sessionId?.slice(0, 12) ?? '?'} ${row.tps ?? '-'} tok/s · 首字 ${row.ttfbMs ?? '-'}ms · 缓存 ${row.cacheHit ?? '-'}% · ${row.finish}`);
         }
         return { kind: 'success', text: lines.join('\n') };
       },

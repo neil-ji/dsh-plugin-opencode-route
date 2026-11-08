@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-opencode-route",
-  "version": "1.7.2",
+  "version": "1.7.6",
   "description": "Pins each OpenCode Go session to a fast gateway route by probing candidate x-opencode-session ids, without sacrificing its prompt cache.",
   "type": "module",
   "license": "MIT",
@@ -39,6 +39,7 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
+    "research",
     "README.md",
     "LICENSE"
   ],

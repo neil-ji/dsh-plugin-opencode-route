@@ -14,7 +14,12 @@ a shared pool (sub-agent sessions lease from the same pool), and pins it by over
 
 - **Probe once, early.** Before a session's first model call it tries 3–4 random session ids with a
   96-token request. A candidate is admissible only when it is alive, reaches first token within 5 s,
-  finishes within 15 s, and is either the `gw` shape or measures at least 70 tok/s.
+  finishes within 15 s, and — when it can be measured — reaches 70 tok/s. A window too short to
+  measure is admitted on liveness alone but ranks by a conservative lower bound (`out × 2`), so it
+  only wins when it can prove it is faster.
+- **Measures speed, not response-id shape.** The id's format (`gw-…`, hex, `chatcmpl…`) only breaks
+  ties now. It used to rank first and exempt `gw` from measuring, which put the slowest shape first
+  on 18 days of local data — see `research/README.md`.
 - **Never moves a session on its own.** Changing the id throws away the provider-side prompt cache,
   so a session is pinned once and keeps that route. After 2 turns or 20k tokens it is cache-locked:
   slow turns are logged, not re-routed.
@@ -55,6 +60,7 @@ config:
   thresholds: { targetTps: 150, degradeTps: 70, strikesToEvict: 2, degradeTtfbMs: 20000 }
   pool: { size: 4, ttlMs: 300000, negativeTtlMs: 60000, maxProbesPerHour: 40 }
   cache: { lockAfterTurns: 2, lockAfterInputTokens: 20000, persistPins: true }
+  experiment: { enabled: false, armRatio: 0.5, salt: route-v1 }  # A/B; control = no probe, no pin
 ```
 
 ## How to verify it actually helps
@@ -84,21 +90,50 @@ How to read it:
 - **dead / rejected natural** — the session would have landed on a 429 upstream or a route too slow to
   admit; switching is a straight win there.
 
-The same numbers are in the UI: hover the header chip (决策 / 保留 / 换道 / 中位提升) or run `/route stats`.
+The same numbers are available from `/route stats`.
 
-A strict A/B is still possible if you want one: set `dryRun: true` for a day, then `enabled` for a
-day, and compare the per-session median `tps` of `turn` events in the two windows. The built-in
-counterfactual usually makes that unnecessary.
+A before/after comparison (`dryRun` for a day, then `enabled` for a day) is not enough on this
+machine: daily gateway drift alone moves the session-median between 0.92× and 1.06× — a large part of
+the 1.2–1.3× effect being measured. Use the A/B below instead.
+
+## Measuring the effect, not the estimate
+
+The probe measures a 96-token synthetic request, so `compare` tells you how well the selector
+picked, not what a real session got. To measure the plugin itself, turn on the A/B:
+
+```yaml
+experiment: { enabled: true, armRatio: 0.5, salt: route-v1 }
+```
+
+Each session is assigned by a stable hash of its id: `treatment` probes and pins, `control` does
+neither — no probe traffic, no header override — and every `turn` event carries `arm`. A session
+never crosses arms, so the two groups run in the same days and daily gateway drift cancels.
+
+```bash
+node research/analyze_ab.mjs
+```
+
+`research/README.md` carries the pre-experiment baseline measured on this machine (446 sessions,
+44k calls): session-median 151 tok/s, 2% of sessions below 70 tok/s, and a best-of-4 upside bound
+of 1.33×. It also shows why a before/after comparison is not enough — day-level drift alone produces
+apparent effects between 0.92× and 1.06× — and how many sessions the A/B needs (34 per arm for 1.2×).
 
 ## Observability
 
-- **Header chip**: `● 170 tok/s hex32` plus `↻`. Hover for the pinned id, probe value, pool best,
-  cache lock state, candidate pool and the last three requests. `↻` re-picks immediately.
-- **`/route`**: text dump of the pool, pins and recent requests. `/route repin` forces a re-pick,
-  `/route stats` prints the effectiveness numbers.
+- **Header capsule**: one read-only badge — `● 实验 170 tok/s` — matching the native session header
+  control (border-box 24px tall, 8px radius on the capsule and the arm tag, 1px border, no fill,
+  fixed-width number slot, 8px horizontal padding). The number is the median of the last three usable
+  requests (window >= 500 ms and >= 60 output tokens, so a delivery burst never inflates it) and
+  counts up when it changes. It sits leftmost so a changing number never shifts its neighbours.
+  During an A/B a plain `实验` label marks the arm (control sessions read `对照组`). Hover it for the
+  current state and the last three requests as a small table. There is no manual re-pick button: the
+  picker is fully automatic.
+- **`/route`**: text dump of the pool, pins and recent requests. `/route stats` prints the
+  effectiveness numbers.
 - **Event log**: `%DSH_HOME%\opencode-route\events.jsonl` — `probe`, `probe-reject`, `probe-dead`,
-  `probe-round`, `keep-natural`, `compare`, `pin`, `skip-pin`, `turn`, `evict`, `repin`.
-- **HTTP**: `GET /opencode-route/status?session=<id>`, `POST /opencode-route/repin?session=<id>`.
+  `probe-round`, `keep-natural`, `compare`, `pin`, `skip-pin`, `turn` (carries `arm` during an
+  experiment), `evict` (carries the sessions whose pin it dropped), `corrective-repin`.
+- **HTTP**: `GET /opencode-route/status?session=<id>` (read-only).
 
 ## Known limits
 
@@ -127,9 +162,9 @@ DSH 插件在会话第一次调用模型前探测若干候选 id，从共享池�
 换道会丢一次 prompt 缓存，所以策略是**一次会话只选一次道、之后不主动换**：满 2 轮或上下文
 ≥ 20k token 后进入缓存锁定，慢只记录不换道；只有 429/超时才换。探针高估时允许一次纠偏。
 
-UI 上是一个会话标题栏徽标：`● 170 tok/s hex32` + `↻` 重选按钮，悬停出详情浮层（不占布局）。
+UI 上是一个会话标题栏徽标：`● 170 tok/s`，只读；悬停出详情浮层（不占布局）。选路全自动，没有手动换路入口。
 
 配置、观测、已知限制见上方英文部分；本地事件日志在 `%DSH_HOME%\opencode-route\events.jsonl`，
-会话内可用 `/route` 查看，或直接点徽标上的 `↻`。
+会话内可用 `/route` 查看。选路全自动，徽标只读。
 
 许可证：MIT
