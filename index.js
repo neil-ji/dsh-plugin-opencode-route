@@ -112,6 +112,9 @@ export function shapeOf(responseId) {
 
 const pairKey = (provider, sessionId) => `${provider}\u0000${sessionId}`;
 const poolKeyOf = (provider, model) => `${provider}\u0000${model}`;
+// No single stream generates faster than this; above it the number is buffering.
+const PLAUSIBLE_TPS = 1000;
+
 const SHAPE_RANK = { gw: 0, hex32: 1, hex40: 1, hex48: 2, msg: 2, chatcmpl: 3, other: 3, none: 4 };
 
 export function apply(ctx, config = {}) {
@@ -173,22 +176,68 @@ export function apply(ctx, config = {}) {
 
   // Every pin decision waits for the restored pins, otherwise the first request
   // after a restart would look pinless, skip the header, and miss the cache.
+  // `recent` and `baselines` are what the badge and the lock decision read; both
+  // live in memory, so a restart used to show an existing session as "待选"
+  // until its next turn. Replay the tail of the event log instead.
+  async function restoreFromLog() {
+    let raw;
+    try { raw = await readFile(path.join(logDir, 'events.jsonl'), 'utf8'); } catch { return; }
+    const cutoff = Date.now() - 86_400_000;
+    const TAIL = 524_288;
+    const tail = raw.length > TAIL ? raw.slice(-TAIL) : raw;
+    const lines = tail.split('\n');
+    if (tail.length !== raw.length) lines.shift(); // the first line is likely torn
+    const turns = [];
+    const compares = [];
+    for (const line of lines) {
+      if (line.length === 0 || line.charCodeAt(0) !== 123) continue;
+      let row;
+      try { row = JSON.parse(line); } catch { continue; }
+      if (typeof row?.sessionId !== 'string' || typeof row?.provider !== 'string') continue;
+      if (typeof row.ts !== 'string' || Date.parse(row.ts) < cutoff) continue;
+      if (row.kind === 'turn') turns.push(row);
+      else if (row.kind === 'compare') compares.push(row);
+    }
+    for (const row of turns.slice(-200)) recent.push(row);
+    for (const row of turns) {
+      const key = pairKey(row.provider, row.sessionId);
+      const prev = baselines.get(key);
+      baselines.set(key, {
+        tps: typeof row.tps === 'number' ? row.tps : (prev?.tps ?? 0),
+        ttfb: typeof row.ttfbMs === 'number' ? row.ttfbMs : (prev?.ttfb ?? 0),
+        n: (prev?.n ?? 0) + 1,
+        lastInput: Number(row.inputTokens ?? 0) + Number(row.cacheReadTokens ?? 0),
+        out: (prev?.out ?? 0) + (Number(row.decodeMs ?? 0) > 0 ? Number(row.out ?? 0) : 0),
+        decode: (prev?.decode ?? 0) + Number(row.decodeMs ?? 0),
+      });
+    }
+    for (const row of compares) {
+      compare.set(pairKey(row.provider, row.sessionId), {
+        source: String(row.source ?? 'probe'),
+        naturalTps: Number(row.naturalTps ?? 0),
+        naturalShape: String(row.naturalShape ?? 'none'),
+        chosenTps: Number(row.chosenTps ?? 0),
+      });
+    }
+  }
+
   let resolvePinsReady;
   const pinsReady = new Promise((resolve) => { resolvePinsReady = resolve; });
   void (async () => {
     try {
-      if (!cacheCfg.persistPins) return;
-      const raw = await readFile(pinsPath, 'utf8');
-      const parsed = JSON.parse(raw);
-      const cutoff = Date.now() - 86_400_000;
-      for (const row of parsed?.pins ?? []) {
-        if (typeof row?.key !== 'string' || typeof row?.id !== 'string') continue;
-        if (typeof row.at === 'number' && row.at < cutoff) continue;
-        pins.set(row.key, { id: row.id, model: String(row.model ?? ''), at: Number(row.at ?? 0), provider: String(row.provider ?? ''), probeTps: Number(row.probeTps ?? 0) });
+      if (cacheCfg.persistPins) {
+        const raw = await readFile(pinsPath, 'utf8');
+        const parsed = JSON.parse(raw);
+        const cutoff = Date.now() - 86_400_000;
+        for (const row of parsed?.pins ?? []) {
+          if (typeof row?.key !== 'string' || typeof row?.id !== 'string') continue;
+          if (typeof row.at === 'number' && row.at < cutoff) continue;
+          pins.set(row.key, { id: row.id, model: String(row.model ?? ''), at: Number(row.at ?? 0), provider: String(row.provider ?? ''), probeTps: Number(row.probeTps ?? 0) });
+        }
       }
-    } catch { /* first run */ } finally {
-      resolvePinsReady?.();
-    }
+    } catch { /* first run */ }
+    try { await restoreFromLog(); } catch { /* a broken log must not block startup */ }
+    resolvePinsReady?.();
   })();
 
   const isScope = (provider, model) =>
@@ -681,10 +730,12 @@ export function apply(ctx, config = {}) {
       const out = usage?.outputTokens ?? 0;
       const genMs = first !== null && last !== null ? last - first : 0;
       // A short window is a delivery burst, not a generation rate: 47 tokens in
-      // 7 ms is not 6,700 tok/s. Keep the raw window in decodeMs/out for
-      // diagnostics, but publish a rate only when it can mean something.
-      const measurable = genMs >= 500 && out >= 60;
-      const tps = measurable ? (out * 1000) / genMs : null;
+      // 7 ms is not 6,700 tok/s. A long window is not enough either — 1,608
+      // tokens buffered in 692 ms reads as 2,322 tok/s — so the implied rate must
+      // also be physically plausible. Keep decodeMs/out for diagnostics.
+      const rate = genMs > 0 ? (out * 1000) / genMs : 0;
+      const measurable = genMs >= 500 && out >= 60 && rate <= PLAUSIBLE_TPS;
+      const tps = measurable ? rate : null;
       const kind = reason?.kind ?? (failed !== undefined ? 'thrown' : 'none');
       const ttfbMs = first === null ? null : Math.round(first - t0);
       const inputTokens = usage?.inputTokens ?? 0;
@@ -713,13 +764,17 @@ export function apply(ctx, config = {}) {
       if (sessionId !== undefined) {
         const key = pairKey(provider, sessionId);
         const base = baselines.get(key);
+        // DSH's own footer is a weighted session rate (total output / total
+        // decode), which is why it never shows a burst: keep the same sums.
         const next = base === undefined
-          ? { tps: tps ?? 0, ttfb: ttfbMs ?? 0, n: 1, lastInput: cacheBase }
+          ? { tps: tps ?? 0, ttfb: ttfbMs ?? 0, n: 1, lastInput: cacheBase, out: genMs > 0 ? out : 0, decode: genMs > 0 ? genMs : 0 }
           : {
             tps: tps === null ? base.tps : base.tps * 0.6 + tps * 0.4,
             ttfb: ttfbMs === null ? base.ttfb : base.ttfb * 0.6 + ttfbMs * 0.4,
             n: base.n + 1,
             lastInput: cacheBase,
+            out: (base.out ?? 0) + (genMs > 0 ? out : 0),
+            decode: (base.decode ?? 0) + (genMs > 0 ? genMs : 0),
           };
         baselines.set(key, next);
         locked = next.n >= cacheCfg.lockAfterTurns || next.lastInput >= cacheCfg.lockAfterInputTokens;
@@ -868,6 +923,13 @@ export function apply(ctx, config = {}) {
       dryRun: cfg.dryRun,
       arm: sessionId === undefined ? 'off' : armOf(String(sessionId)),
       experiment: { enabled: expCfg?.enabled === true, armRatio: expCfg?.armRatio ?? null },
+      rate: baseline === undefined || !((baseline.decode ?? 0) > 0)
+        ? null
+        : {
+          out: Math.round(baseline.out ?? 0),
+          decodeMs: Math.round(baseline.decode ?? 0),
+          tps: Math.round(((baseline.out ?? 0) * 1000) / (baseline.decode ?? 1)),
+        },
       state: probeState.active ? 'probing' : (pin !== undefined ? 'pinned' : (locked ? 'locked' : 'idle')),
       locked,
       probe: probeState,
@@ -884,7 +946,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.7.6',
+    version: '1.7.7',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     subagentMode: cfg.subagents.mode,

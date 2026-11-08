@@ -122,17 +122,22 @@ apparent effects between 0.92× and 1.06× — and how many sessions the A/B nee
 
 - **Header capsule**: one read-only badge — `● 实验 170 tok/s` — matching the native session header
   control (border-box 24px tall, 8px radius on the capsule and the arm tag, 1px border, no fill,
-  fixed-width number slot, 8px horizontal padding). The number is the median of the last three usable
-  requests (window >= 500 ms and >= 60 output tokens, so a delivery burst never inflates it) and
-  counts up when it changes. It sits leftmost so a changing number never shifts its neighbours.
-  During an A/B a plain `实验` label marks the arm (control sessions read `对照组`). Hover it for the
-  current state and the last three requests as a small table. There is no manual re-pick button: the
-  picker is fully automatic.
+  fixed-width number slot, 8px horizontal padding, literal colours). The number is the session's
+  weighted rate — total output tokens over total decode time, the same definition DSH's composer
+  footer uses — so a single buffered burst cannot move it. It falls back to the median of the last
+  three usable requests (window >= 500 ms, >= 60 output tokens, <= 1000 tok/s) on an older host, and
+  rolls digit by digit when it changes. Five-digit speeds would compact to `12.2K` and seven-digit
+  ones to `1.2M`, though the ceiling makes neither reachable. It sits leftmost so a changing number
+  never shifts its neighbours. During an A/B a plain `实验` label marks the arm (control sessions read
+  `对照组`). Hover it for a small table of the last three requests (time, speed, first token, cache) —
+  the panel carries no prose. There is no manual re-pick button: the picker is fully automatic.
 - **`/route`**: text dump of the pool, pins and recent requests. `/route stats` prints the
   effectiveness numbers.
 - **Event log**: `%DSH_HOME%\opencode-route\events.jsonl` — `probe`, `probe-reject`, `probe-dead`,
   `probe-round`, `keep-natural`, `compare`, `pin`, `skip-pin`, `turn` (carries `arm` during an
   experiment), `evict` (carries the sessions whose pin it dropped), `corrective-repin`.
+  On startup the plugin replays the tail of this log, so an existing session keeps its badge
+  (pinned/locked and the last speeds) instead of looking unselected until its next turn.
 - **HTTP**: `GET /opencode-route/status?session=<id>` (read-only).
 
 ## Known limits

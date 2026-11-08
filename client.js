@@ -19,42 +19,94 @@ window.__ModuleLoader__.load({
    border-l2, transparent fill. A read-only badge: dot, optional arm tag, number. */
 .orCapsule{box-sizing:border-box;display:inline-flex;align-items:center;align-self:center;gap:6px;
   height:24px;min-height:24px;max-height:24px;padding:0 8px;
-  border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:none;
-  font-size:11px;line-height:1;color:var(--dsw-alias-label-secondary,#5b6068);white-space:nowrap;
+  border-radius:8px;border:1px solid var(--or-border,rgba(0,0,0,.16));background:none;
+  font-size:11px;line-height:1;color:var(--or-fg2,#61666b);white-space:nowrap;
   user-select:none;cursor:default;max-width:min(260px,46vw)}
 .orCapsule *{box-sizing:border-box}
-.orDot{width:5px;height:5px;border-radius:50%;flex:none;background:var(--dsw-alias-label-secondary,#61666b)}
-.orDot.fast{background:var(--dsw-alias-state-success-primary)}
-.orDot.slow{background:var(--dsw-alias-state-warn-primary)}
-.orDot.busy{background:var(--dsw-alias-brand-primary);animation:orPulse 1s ease-in-out infinite}
-.orDot.off{background:var(--dsw-alias-label-secondary,#61666b)}
+.orDot{width:5px;height:5px;border-radius:50%;flex:none;background:var(--or-fg2,#61666b)}
+.orDot.fast{background:#22c55e}
+.orDot.slow{background:#f59e0b}
+.orDot.busy{background:var(--or-fg,#0f1115);animation:orPulse 1s ease-in-out infinite}
+.orDot.off{background:var(--or-fg2,#61666b)}
 .orLabel{display:inline-flex;align-items:center;gap:6px;min-width:0}
-.orNum{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary,#1b1c1f);
-  width:66px;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.orNum.text{text-align:center}
-.orTag{flex:none;display:inline-flex;align-items:center;height:16px;padding:0 5px;
+.orNum{font-variant-numeric:tabular-nums;color:var(--or-fg,#0f1115);
+  width:60px;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Odometer: each changed character rolls inside its own clipped cell, so the
+   rest of the number (and the unit) never moves. */
+.orRoll{display:inline-flex;align-items:baseline;vertical-align:baseline}
+.orRollCell{position:relative;display:inline-block;height:1.15em;line-height:1.15em;
+  overflow:hidden;vertical-align:baseline}
+.orRollOld{position:absolute;left:0;top:0;animation:orRollOut .2s ease-in forwards}
+.orRollNew{display:inline-block;animation:orRollIn .2s ease-out}
+@keyframes orRollIn{from{transform:translateY(100%)}to{transform:translateY(0)}}
+@keyframes orRollOut{from{transform:translateY(0)}to{transform:translateY(-100%)}}
+@media (prefers-reduced-motion: reduce){.orRollOld{display:none}.orRollNew{animation:none}}
+/* Text states (待选/对照组/挑选中) are transient, so they size to their content
+   instead of reserving the numeric slot: that is where most of the width went. */
+.orNum.text{width:auto;text-align:left}
+.orTag{flex:none;display:inline-flex;align-items:center;height:16px;padding:0 4px;
   border-radius:8px;background:rgba(127,127,127,.12);
   font-size:9px;font-weight:600;line-height:1;letter-spacing:.04em;
-  color:var(--dsw-alias-label-secondary,#5b6068)}
+  color:var(--or-fg2,#61666b)}
 .orSrOnly{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
   clip:rect(0 0 0 0);white-space:nowrap;border:0}
 @media (prefers-reduced-motion: reduce){ .orDot.busy{animation:none} }
 .orTip{position:fixed;z-index:10000;display:flex;flex-direction:column;gap:4px;font-size:11px;line-height:16px;
-  color:var(--dsw-alias-label-secondary,#5b6068);padding:9px 11px;border-radius:8px;max-width:420px;min-width:230px;
-  background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-l2);
+  color:var(--or-fg2,#61666b);padding:9px 11px;border-radius:8px;max-width:420px;min-width:230px;
+  background:var(--or-surface,#fff);border:1px solid var(--or-border,rgba(0,0,0,.16));
   box-shadow:0 8px 28px rgba(0,0,0,.16);pointer-events:none}
-.orTip b{font-weight:600;color:var(--dsw-alias-label-primary)}
 .orTable{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin-top:1px}
 .orTable th{font-weight:500;font-size:10px;letter-spacing:.03em;text-align:right;
-  color:var(--dsw-alias-label-secondary,#5b6068);padding:0 0 4px;border-bottom:1px solid var(--dsw-alias-border-l2)}
+  color:var(--or-fg2,#61666b);padding:0 0 4px;border-bottom:1px solid var(--or-border,rgba(0,0,0,.16))}
 .orTable th:first-child{text-align:left}
-.orTable td{text-align:right;white-space:nowrap;padding:3px 0 0;color:var(--dsw-alias-label-primary)}
-.orTable td:first-child{text-align:left;color:var(--dsw-alias-label-secondary)}
-.orTable td:last-child{color:var(--dsw-alias-label-secondary)}
+.orTable td{text-align:right;white-space:nowrap;padding:3px 0 0;color:var(--or-fg,#0f1115)}
+.orTable td:first-child{text-align:left;color:var(--or-fg2,#61666b)}
+.orTable td:last-child{color:var(--or-fg2,#61666b)}
 .orTip .num{font-variant-numeric:tabular-nums}
 `;
 
-    const REDUCE = '(prefers-reduced-motion: reduce)';
+    // 4 digits fit the slot; beyond that the unit changes to keep it short.
+    // (A real turn never gets there — the burst filter caps the window — but the
+    // badge should still read sensibly if it ever does.)
+    function formatSpeed(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '—';
+      if (n >= 1_000_000 || n / 1000 >= 999.95) return `${(n / 1_000_000).toFixed(1)}M`;
+      if (n >= 10_000) return `${(n / 1000).toFixed(1)}K`;
+      return String(Math.round(n));
+    }
+
+    // The stated colours are literals on purpose: relying on the host's CSS
+    // variables couples this chip to an internal naming scheme. Instead read the
+    // rendered page background once per render and pick the matching palette.
+    const LIGHT_THEME = {
+      fg: '#0f1115', fg2: '#61666b', border: 'rgba(0,0,0,.16)', surface: '#ffffff',
+      shadow: '0 6px 20px rgba(0,0,0,.14)',
+    };
+    const DARK_THEME = {
+      fg: '#f9fafb', fg2: '#cfd3d6', border: 'rgba(255,255,255,.2)', surface: '#2c2c2e',
+      shadow: '0 6px 20px rgba(0,0,0,.5)',
+    };
+    function channelLuminance(color) {
+      const match = /rgba?\(([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?\)/.exec(color ?? '');
+      if (match === null) return null;
+      if (match[4] !== undefined && Number(match[4]) === 0) return null;
+      return (0.2126 * Number(match[1]) + 0.7152 * Number(match[2]) + 0.0722 * Number(match[3])) / 255;
+    }
+    function paletteOf(element) {
+      // Walk out from the chip: the canvas colour can live on the body, on the
+      // root, or on an app wrapper, and none of those names are ours to rely on.
+      let luminance = null;
+      for (let node = element; node !== null && luminance === null; node = node.parentElement) {
+        luminance = channelLuminance(getComputedStyle(node).backgroundColor);
+      }
+      if (luminance === null) luminance = channelLuminance(getComputedStyle(document.body).backgroundColor);
+      if (luminance === null) luminance = channelLuminance(getComputedStyle(document.documentElement).backgroundColor);
+      const dark = luminance === null
+        ? window.matchMedia('(prefers-color-scheme: dark)').matches
+        : luminance < 0.5;
+      return dark ? DARK_THEME : LIGHT_THEME;
+    }
 
     // The event log is ISO/UTC; the panel shows local wall-clock time.
     function clock(iso) {
@@ -62,44 +114,31 @@ window.__ModuleLoader__.load({
       return Number.isNaN(d.getTime()) ? String(iso).slice(11, 19) : d.toLocaleTimeString('zh-CN', { hour12: false });
     }
 
-    // Count up to a new speed instead of swapping the text in one frame: the
-    // chip is a live readout, and a 380 ms ease makes the change readable
-    // without drawing attention. Reduced motion gets the final value at once.
-    function useCountUp(value, duration = 380) {
-      const [shown, setShown] = useState(value);
-      const current = useRef(value);
-      useEffect(() => {
-        if (typeof value !== 'number' || !Number.isFinite(value)) {
-          current.current = value;
-          setShown(value);
-          return undefined;
-        }
-        if (window.matchMedia?.(REDUCE).matches) {
-          current.current = value;
-          setShown(value);
-          return undefined;
-        }
-        const from = typeof current.current === 'number' ? current.current : value;
-        if (from === value) { setShown(value); return undefined; }
-        const t0 = performance.now();
-        let raf = 0;
-        const tick = (now) => {
-          const p = Math.min(1, (now - t0) / duration);
-          const next = Math.round(from + (value - from) * (1 - (1 - p) ** 3));
-          current.current = next;
-          setShown(next);
-          if (p < 1) raf = requestAnimationFrame(tick);
-          else { current.current = value; setShown(value); }
-        };
-        raf = requestAnimationFrame(tick);
-        return () => cancelAnimationFrame(raf);
-      }, [value, duration]);
-      return shown;
+    // Odometer: only the characters that changed roll, each inside its own
+    // clipped cell. The number never reflows, and a one-digit change does not
+    // redraw the whole value.
+    function RollingNumber(props) {
+      const text = formatSpeed(props.value);
+      const previous = useRef(text);
+      const old = previous.current;
+      useEffect(() => { previous.current = text; }, [text]);
+      const oldChars = [...old];
+      const chars = [...text];
+      return h('span', { className: 'orRoll' }, chars.map((ch, index) => {
+        // compare from the right so the ones digit stays in place when the value
+        // grows or shrinks by a digit
+        const fromRight = chars.length - 1 - index;
+        const was = oldChars[oldChars.length - 1 - fromRight];
+        const changed = was !== undefined && was !== ch;
+        return h('span', { key: `${fromRight}-${ch}`, className: 'orRollCell' },
+          changed ? h('span', { className: 'orRollOld', 'aria-hidden': 'true' }, was) : null,
+          h('span', { className: changed ? 'orRollNew' : undefined }, ch),
+        );
+      }));
     }
 
     function Speed(props) {
-      const n = useCountUp(props.value);
-      return h(React.Fragment, null, String(n), ' tok/s');
+      return h(React.Fragment, null, h(RollingNumber, { value: props.value }), ' tok/s');
     }
 
     function Chip(props) {
@@ -185,11 +224,15 @@ window.__ModuleLoader__.load({
       // requests (window >= 500 ms, at least 60 output tokens) so the number
       // moves only when the session's speed actually changes.
       const recentTurns = Array.isArray(data.turns) ? data.turns : [];
-      const usable = (row) => typeof row.tps === 'number' && row.tps > 0
+      const usable = (row) => typeof row.tps === 'number' && row.tps > 0 && row.tps <= 1000
         && (row.decodeMs === null || row.decodeMs === undefined || row.decodeMs >= 500)
         && (row.out === null || row.out === undefined || row.out >= 60);
       const sample = recentTurns.filter(usable).slice(-3).map((row) => row.tps).sort((a, b) => a - b);
-      const tps = sample.length ? sample[Math.floor((sample.length - 1) / 2)] : null;
+      const median = sample.length ? sample[Math.floor((sample.length - 1) / 2)] : null;
+      // Same definition as DSH's composer footer: total output over total decode
+      // across the session, so one buffered burst cannot move it.
+      const rate = data.rate && typeof data.rate.tps === 'number' && data.rate.tps > 0 ? data.rate.tps : null;
+      const tps = rate ?? median;
       const probing = data.state === 'probing';
       let dot = 'off';
       let textLabel = null;
@@ -199,36 +242,34 @@ window.__ModuleLoader__.load({
       else if (data.state === 'pinned' || data.state === 'locked') textLabel = '已选路';
       else textLabel = '待选';
 
-      // Only what a reader can act on: current state, the last few request
-      // speeds, and the experiment arm. Internal identifiers (response-id shape,
-      // pinned id, pool entries) stay in `/route`, where they are asked for.
-      const tipRows = [h('div', { key: 'state' },
-        control ? '实验对照组，本会话不参与选路'
-          : probing ? '正在挑选路由…'
-            : data.state === 'locked' ? '路由已锁定，不会再自动换道'
-              : data.state === 'pinned' ? '已固定到一条路由'
-                : '使用会话自身的路由')];
-      if (data.experiment && data.experiment.enabled) {
-        tipRows.push(h('div', { key: 'arm' }, `实验：${control ? '对照组' : '处理组'}`));
-      }
+      // The hover panel is just the table: the chip already carries the state,
+      // and the column headers explain the rows without prose.
+      const tipRows = [];
       if (recentTurns.length) {
         const rows = recentTurns.slice(-3).reverse();
         const cell = (value) => h('td', null, value);
-        tipRows.push(h('div', { key: 'turns', style: { marginTop: '4px' } }, h('b', null, '最近请求')));
         tipRows.push(h('table', { key: 'table', className: 'orTable' },
           h('thead', null, h('tr', null,
             h('th', { scope: 'col' }, '时间'), h('th', { scope: 'col' }, '速度'),
             h('th', { scope: 'col' }, '首字'), h('th', { scope: 'col' }, '缓存'))),
           h('tbody', null, rows.map((row, index) => h('tr', { key: `${row.ts}-${index}` },
             cell(clock(row.ts)),
-            cell(usable(row) ? `${row.tps} tok/s` : '—'),
+            cell(usable(row) ? `${formatSpeed(row.tps)} tok/s` : '—'),
             cell(row.ttfbMs ? `${(row.ttfbMs / 1000).toFixed(1)}s` : '—'),
             cell(row.cacheHit === null || row.cacheHit === undefined ? '—' : `${row.cacheHit}%`),
           )))));
       }
 
-      const floating = hover && anchor
-        ? h('div', { className: 'orTip', style: anchor }, tipRows)
+      const palette = paletteOf(chipRef.current);
+      const theme = {
+        '--or-fg': palette.fg,
+        '--or-fg2': palette.fg2,
+        '--or-border': palette.border,
+        '--or-surface': palette.surface,
+        '--or-shadow': palette.shadow,
+      };
+      const floating = hover && anchor && tipRows.length
+        ? h('div', { className: 'orTip', style: { ...anchor, ...theme } }, tipRows)
         : null;
       const portal = floating === null ? null
         : (createPortal ? createPortal(floating, document.body) : floating);
@@ -241,11 +282,12 @@ window.__ModuleLoader__.load({
           ? '正在挑选路由'
           : data.state === 'locked'
             ? '路由已锁定'
-            : tps !== null ? `最近 ${tps} tok/s` : '还没有足够长的样本';
+            : tps !== null ? `当前 ${formatSpeed(tps)} tok/s` : '还没有足够长的样本';
       return h(React.Fragment, null,
         h('div', {
           className: 'orCapsule',
           ref: chipRef,
+          style: theme,
           role: 'group',
           'aria-label': 'OpenCode Go 路由',
           onMouseEnter: showTip,
@@ -255,7 +297,7 @@ window.__ModuleLoader__.load({
           data.experiment && data.experiment.enabled
             ? h('span', {
               className: 'orTag',
-              title: control ? 'A/B 实验：对照组（不探测、不换道）' : 'A/B 实验：处理组（探测并钉住）',
+              title: control ? 'A/B 实验：对照组' : 'A/B 实验：处理组',
             }, '实验')
             : null,
           h('span', { className: 'orLabel' },
