@@ -53,7 +53,7 @@ window.__ModuleLoader__.load({
 @keyframes orRollIn{from{transform:translateY(100%)}to{transform:translateY(0)}}
 @keyframes orRollOut{from{transform:translateY(0)}to{transform:translateY(-100%)}}
 @media (prefers-reduced-motion: reduce){.orRollOld{display:none}.orRollNew{animation:none}}
-/* Text states (待选/对照组/挑选中) are transient, so they size to their content
+/* Text states (待选/对照组) are transient, so they size to their content
    instead of reserving the numeric slot: that is where most of the width went. */
 .orNum.text{width:auto;text-align:left}
 .orTag{flex:none;display:inline-flex;align-items:center;height:16px;padding:0 4px;
@@ -206,7 +206,7 @@ window.__ModuleLoader__.load({
           } finally {
             running = false;
           }
-          if (alive) timer = setTimeout(tick, state === 'probing' ? 900 : 3000);
+          if (alive) timer = setTimeout(tick, 3000);
         };
         const onVisible = () => {
           if (document.hidden) return;
@@ -276,13 +276,10 @@ window.__ModuleLoader__.load({
       // across the session, so one buffered burst cannot move it.
       const rate = current.rate && typeof current.rate.tps === 'number' && current.rate.tps > 0 ? current.rate.tps : null;
       const tps = rate ?? median;
-      const probing = current.state === 'probing';
       let dot = 'off';
       let textLabel = null;
-      if (probing) { dot = 'busy'; textLabel = '挑选中…'; }
-      else if (control) { dot = 'off'; textLabel = '对照组'; }
+      if (control) { dot = 'off'; textLabel = '对照组'; }
       else if (tps !== null) { dot = tps >= 150 ? 'fast' : 'slow'; }
-      else if (current.state === 'pinned' || current.state === 'locked') textLabel = '已选路';
       else textLabel = '待选';
 
       // The hover panel is just the table: the chip already carries the state,
@@ -320,12 +317,8 @@ window.__ModuleLoader__.load({
       // One atomic status sentence for assistive tech; the visible parts are
       // aria-hidden so a polling update does not announce a bare number.
       const statusText = control
-        ? '实验对照组，不参与选路'
-        : probing
-          ? '正在挑选路由'
-          : current.state === 'locked'
-            ? '路由已锁定'
-            : tps !== null ? `当前 ${formatSpeed(tps)} tok/s` : '还没有足够长的样本';
+        ? '实验对照组，不回滚重试'
+        : tps !== null ? `当前 ${formatSpeed(tps)} tok/s` : '还没有足够长的样本';
       return h(React.Fragment, null,
         h('div', {
           className: 'orCapsule',
