@@ -552,7 +552,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.10.2',
+    version: '1.10.3',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     reroll: cfg.reroll?.enabled ? { windowMs: cfg.reroll.windowMs, thresholdTps: cfg.reroll.thresholdTps, maxRetries: cfg.reroll.maxRetries } : null,

@@ -60,6 +60,13 @@ window.__ModuleLoader__.load({
   border-radius:8px;background:rgba(127,127,127,.12);
   font-size:9px;font-weight:600;line-height:1;letter-spacing:.04em;
   color:var(--or-fg2,#61666b)}
+.orDots{display:inline-flex;align-items:center;gap:3px;margin-left:4px}
+.orDots i{width:4px;height:4px;border-radius:50%;background:currentColor;opacity:.25;
+  animation:orDots 1.2s ease-in-out infinite}
+.orDots i:nth-child(2){animation-delay:.15s}
+.orDots i:nth-child(3){animation-delay:.3s}
+@keyframes orDots{0%,60%,100%{opacity:.25}30%{opacity:1}}
+@media (prefers-reduced-motion: reduce){.orDots i{animation:none;opacity:.6}}
 .orSkel{display:block;width:22px;height:7px;border-radius:2px;
   background:rgba(127,127,127,.18);margin-left:auto}
 .orSrOnly{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
@@ -150,6 +157,10 @@ window.__ModuleLoader__.load({
       }));
     }
 
+    function Dots() {
+      return h('span', { className: 'orDots', 'aria-hidden': 'true' }, h('i'), h('i'), h('i'));
+    }
+
     function Speed(props) {
       return h(React.Fragment, null, h(RollingNumber, { value: props.value }), ' tok/s');
     }
@@ -193,7 +204,7 @@ window.__ModuleLoader__.load({
             if (res.ok && alive) {
               const next = await res.json();
               // While the first request is still in flight, poll fast enough to
-              // catch the 2 s测速 window and any retry.
+              // catch the 2 s measuring window and any retry.
               fast = next.rerollState?.active === true
                 || (Array.isArray(next.turns) && next.turns.length === 0 && next.arm === 'treatment');
               dataId.current = sessionId;
@@ -283,7 +294,9 @@ window.__ModuleLoader__.load({
       let textLabel = null;
       if (rerolling) {
         dot = 'busy';
-        textLabel = current.rerollState.attempt > 0 ? `重试 ${current.rerollState.attempt}…` : '测速…';
+        textLabel = h(React.Fragment, null,
+          current.rerollState.attempt > 0 ? `重试 ${current.rerollState.attempt}` : '测速',
+          h(Dots));
       } else if (control) { dot = 'off'; textLabel = '对照组'; }
       else if (tps !== null) { dot = tps >= 150 ? 'fast' : 'slow'; }
       else textLabel = '待选';
