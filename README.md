@@ -81,15 +81,36 @@ it. Use `--since <timestamp>` to analyse that cohort only.
 `research/README.md` keeps the baseline study (446 sessions / 44k calls) that
 motivated the design; it is history, not the current behaviour.
 
-## Known limits
+## Side effects
 
-- The provider may keep generating for a moment after an abort; the plugin can
-  only stop consuming the stream.
-- A buffered first window adds `windowMs` to the first visible token of every
-  treatment session.
-- `x-opencode-session` is observed behaviour, not a documented API; if it ever
-  stops controlling the backend, `/route test` will show an ICC near zero.
-- A session's arm is a pure hash of its id, so arms can be uneven at small n.
+These are the costs of the reroll; they apply only to a **treatment session's
+first request**, and only when that request is actually aborted. Later turns are
+a plain pass-through.
+
+- **First token arrives later.** Each attempt costs its own time-to-first-token
+  (3-5 s here) plus the 2 s measuring window before it can be judged; the first
+  visible token lands after the last attempt's window. At the tuned 1.75
+  attempts that is roughly **10 s instead of ~4 s**; four slow attempts cost
+  about 25 s. The accepted stream itself is then replayed at its original
+  cadence, so the rest of the answer is not slowed down.
+- **Extra input tokens.** Every aborted attempt re-prefills the prompt under a
+  fresh id, and that prefill is cold. At 1.75 attempts the session pays about
+  0.75 extra prefills; with a 15k-token first prompt that is ~11k extra input
+  tokens. `maxPromptTokens` (60k) caps the worst case.
+- **Extra output tokens.** An aborted attempt has already generated up to one
+  window of output (2 s at the observed rate, roughly 200-300 tokens).
+- **The aborted attempt may keep generating upstream** for a moment: the plugin
+  can stop consuming the stream, not cancel the provider's work.
+- **Native first-token latency includes the reroll.** DSH's own per-turn TTFB
+  measures from the request, so it shows the wasted attempts; the plugin's
+  `turn` event records TTFB from the accepted attempt only. Decode speed is
+  preserved by the cadence replay.
+- **A session's route changes**, so the accepted attempt starts with a cold
+  prompt cache under the new id. Subsequent turns rebuild it; a cache that was
+  already warm under the original id is lost once.
+
+Disable `reroll.enabled` (or `enabled`) to remove all of the above; control
+sessions in the A/B have none of it.
 
 ## License
 
