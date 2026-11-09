@@ -966,6 +966,84 @@ export function apply(ctx, config = {}) {
     return compareSummary;
   }
 
+  // Controlled check: probe the same prompt under several route ids, interleaved
+  // and repeated. If between-id variance is no larger than within-id variance,
+  // the session id does not control speed and the picker has nothing to select on.
+  async function routeTest(provider, model, naturalId) {
+    const ids = [naturalId ?? `session-${randomUUID()}`,
+      `session-${randomUUID()}`, `session-${randomUUID()}`, `session-${randomUUID()}`];
+    const rounds = Math.max(2, Math.min(6, Number(probeCfg.testRounds ?? 3)));
+    const prompt = 'Write the integers from 1 to 120 in order, separated by single spaces, and nothing else.';
+    const rows = [];
+    for (let r = 0; r < rounds; r += 1) {
+      const order = [...ids].sort(() => Math.random() - 0.5);
+      for (const id of order) {
+        const options = {
+          provider, model, sessionId: id, maxTokens: 220,
+          messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+          signal: AbortSignal.timeout(25000),
+        };
+        probing.add(options);
+        try {
+          let first = null;
+          let last = null;
+          let usage = null;
+          for await (const chunk of ctx.llm.stream(options)) {
+            if (isTokenChunk(chunk)) {
+              const now = performance.now();
+              if (first === null) first = now;
+              last = now;
+            } else if (chunk.type === 'usage') usage = chunk.usage;
+          }
+          const out = usage?.outputTokens ?? 0;
+          const decodeMs = first !== null && last !== null ? last - first : 0;
+          const tps = decodeMs >= 300 && out >= 40 ? (out * 1000) / decodeMs : null;
+          rows.push({ id, tps, out, decodeMs });
+        } catch (error) {
+          rows.push({ id, tps: null, out: 0, decodeMs: 0, error: String(error?.message ?? error) });
+        } finally {
+          probing.delete(options);
+        }
+      }
+    }
+    const measured = rows.filter((row) => row.tps !== null && row.tps > 0);
+    const byId = new Map();
+    for (const row of measured) {
+      if (!byId.has(row.id)) byId.set(row.id, []);
+      byId.get(row.id).push(row.tps);
+    }
+    const groups = [...byId.entries()].filter(([, list]) => list.length >= 2);
+    if (groups.length < 2) {
+      return `样本不足：${rows.length} 次请求里只有 ${measured.length} 次可测，${groups.length} 个 id 达到 2 次。再跑一次 /route test。`;
+    }
+    const logs = groups.map(([id, list]) => [id, list.map((x) => Math.log(x))]);
+    const all = logs.flatMap(([, list]) => list);
+    const grand = all.reduce((a, b) => a + b, 0) / all.length;
+    const k = logs.length;
+    const n = all.length;
+    let ssb = 0;
+    let ssw = 0;
+    for (const [, list] of logs) {
+      const mean = list.reduce((a, b) => a + b, 0) / list.length;
+      ssb += list.length * (mean - grand) ** 2;
+      ssw += list.reduce((a, x) => a + (x - mean) ** 2, 0);
+    }
+    const msb = ssb / (k - 1);
+    const msw = ssw / Math.max(1, n - k);
+    const icc = Math.max(0, (msb - msw) / (msb + ((n - k) / (k - 1)) * msw));
+    const lines = [];
+    for (const [id, list] of groups) {
+      const sorted = [...list].sort((a, b) => a - b);
+      const mid = sorted[Math.floor((sorted.length - 1) / 2)];
+      lines.push(`${id === naturalId ? 'natural ' : 'random  '}${id.slice(0, 20)}  n=${list.length}  med ${Math.round(mid)}`);
+    }
+    lines.push(`between-id SD(log) ${Math.sqrt(Math.max(msb - msw, 0) / (n / k)).toFixed(3)} · within-id SD(log) ${Math.sqrt(msw).toFixed(3)} · ICC ${icc.toFixed(2)}`);
+    lines.push(icc >= 0.5
+      ? '结论：id 之间的差异明显大于同一 id 的重复波动 → 路由确实影响速度，探针值得继续。'
+      : '结论：id 之间的差异和同一 id 的重复波动差不多 → 速度不是 id 决定的，按探针选路没有可选的信号。');
+    return lines.join('\n');
+  }
+
   function statusPayload(sessionId) {
     const turns = recent
       .filter((row) => row.kind === 'turn' && (sessionId === undefined || row.sessionId === sessionId))
@@ -1037,7 +1115,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.8.0',
+    version: '1.8.1',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     subagentMode: cfg.subagents.mode,
@@ -1087,6 +1165,13 @@ export function apply(ctx, config = {}) {
       description: 'Show OpenCode Go route pins, the lease pool, and recent speeds',
       handler: async (invocation) => {
         const raw = String(invocation?.rawInput ?? '').trim().toLowerCase();
+        if (raw === 'test' || raw === '自测') {
+          const lastTurn = [...recent].reverse().find((row) => row.kind === 'turn' && row.provider === cfg.providers[0]);
+          const model = lastTurn?.model;
+          if (model === undefined) return { kind: 'error', text: '先在这个会话里发一条消息，再运行 /route test。' };
+          const sessionId = invocation?.agent?.session?.id;
+          return { kind: 'success', text: await routeTest(lastTurn.provider, model, sessionId === undefined ? undefined : String(sessionId)) };
+        }
         if (raw === 'stats' || raw === '效果' || raw === '验证') {
           const s = summarizeCompare();
           const lines = [
