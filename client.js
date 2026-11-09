@@ -295,7 +295,7 @@ window.__ModuleLoader__.load({
       if (rerolling) {
         dot = 'busy';
         textLabel = h(React.Fragment, null,
-          current.rerollState.attempt > 0 ? 'Rolling' : '测速中',
+          current.rerollState.attempt > 0 ? 'Rolling' : 'Measuring',
           h(Dots));
       } else if (control) { dot = 'off'; textLabel = '对照组'; }
       else if (tps !== null) { dot = tps >= 150 ? 'fast' : 'slow'; }
