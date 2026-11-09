@@ -224,6 +224,8 @@ export function apply(ctx, config = {}) {
   // never shown. `timing` reports the real first/last token of the accepted
   // stream to the guard, whose own timestamps would otherwise start at the
   // flush.
+  const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
   async function* reroll(options, next, timing) {
     const sid = options.sessionId === undefined ? null : String(options.sessionId);
     const mark = (attempt, early) => {
@@ -245,7 +247,7 @@ export function apply(ctx, config = {}) {
       const attemptStart = performance.now();
       mark(attempt, null);
       const iterator = (own ? ctx.llm.stream(o2) : next())[Symbol.asyncIterator]();
-      const buffered = [];
+      const queue = [];
       let first = null;
       let last = null;
       let chars = 0;
@@ -256,19 +258,21 @@ export function apply(ctx, config = {}) {
           const step = await iterator.next();
           if (step.done === true) break;
           const chunk = step.value;
-          buffered.push(chunk);
+          const at = performance.now();
+          queue.push({ chunk, at });
           if (!isTokenChunk(chunk)) continue;
-          const now = performance.now();
-          if (first === null) first = now;
-          last = now;
+          if (first === null) first = at;
+          last = at;
           chars += chunkChars(chunk);
-          if (early === null && now - first >= windowMs) {
-            early = Math.round((chars / 4) / ((now - first) / 1000));
+          if (early === null && at - first >= windowMs) {
+            early = Math.round((chars / 4) / ((at - first) / 1000));
             if (early < threshold) { slow = true; break; }
           }
         }
       } finally {
-        if (slow) {
+        // Only abandon the stream when a retry will follow; the last slow
+        // attempt has to be drained and shown.
+        if (slow && attempt < maxRetries) {
           try { await iterator.return?.(); } catch { /* stop consuming */ }
           if (own) controller.abort();
         }
@@ -284,31 +288,50 @@ export function apply(ctx, config = {}) {
         attempt += 1;
         continue;
       }
-      // Accept: flush the buffer, then stream the rest with the real timing.
+      // Accept: replay the queue at its original cadence, shifted by one window.
+      // Flushing it instead would reach the consumer as one burst and DSH's own
+      // tps (computed from chunk arrival) would read thousands of tokens/s.
+      clear();
+      let done = false;
+      let readerError = null;
+      const reader = (async () => {
+        try {
+          for (;;) {
+            const step = await iterator.next();
+            if (step.done === true) break;
+            queue.push({ chunk: step.value, at: performance.now() });
+          }
+        } catch (error) {
+          readerError = error;
+        } finally {
+          done = true;
+        }
+      })();
+      const lag = windowMs;
+      let head = 0;
+      while (!done || head < queue.length) {
+        if (head >= queue.length) { await sleep(2); continue; }
+        const entry = queue[head];
+        const wait = entry.at + lag - performance.now();
+        if (wait > 0) { await sleep(Math.min(wait, 50)); continue; }
+        head += 1;
+        if (isTokenChunk(entry.chunk)) {
+          if (first === null) first = entry.at;
+          last = entry.at;
+          chars += chunkChars(entry.chunk);
+        }
+        yield entry.chunk;
+      }
+      await reader;
+      if (readerError !== null) throw readerError;
       timing.first = first;
       timing.last = last;
       timing.start = attemptStart;
-      for (const chunk of buffered) yield chunk;
-      for (;;) {
-        const step = await iterator.next();
-        if (step.done === true) break;
-        const chunk = step.value;
-        if (isTokenChunk(chunk)) {
-          const now = performance.now();
-          if (first === null) first = now;
-          last = now;
-          chars += chunkChars(chunk);
-        }
-        yield chunk;
-      }
-      timing.first = first;
-      timing.last = last;
       log({
         kind: 'reroll', provider: options.provider, model: options.model,
         sessionId: options.sessionId, attempt, id, early, aborted: false,
         final: first !== null && last !== null && last > first ? Math.round((chars / 4) * 1000 / (last - first)) : null,
       });
-      clear();
       return;
     }
   }
@@ -552,7 +575,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.10.7',
+    version: '1.10.8',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     reroll: cfg.reroll?.enabled ? { windowMs: cfg.reroll.windowMs, thresholdTps: cfg.reroll.thresholdTps, maxRetries: cfg.reroll.maxRetries } : null,

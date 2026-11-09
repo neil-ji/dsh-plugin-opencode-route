@@ -14,7 +14,10 @@ new one"), automated and hidden from the conversation.
   usual. The plugin buffers the first `windowMs` (2 s) of tokens, computes the
   running rate, and if it is below `thresholdTps` (150 tok/s) it drops the
   attempt and retries on a fresh id, up to `maxRetries` (3) times. The buffered
-  window is never shown, so the user only sees the accepted attempt.
+  window is never shown, so the user only sees the accepted attempt. The accepted
+  stream is replayed at its original cadence, one window behind, so downstream
+  (including DSH's own token-rate statistics) sees the real timing instead of a
+  2 s burst.
 - **First request only.** Once a session has called the model, its prompt cache
   is worth protecting: later turns are never moved. A first prompt larger than
   `maxPromptTokens` (60k) is skipped too, because every retry pays a full
