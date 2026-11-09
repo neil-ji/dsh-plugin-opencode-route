@@ -64,6 +64,16 @@ const DEFAULTS = {
   subagents: {
     mode: 'pool',       // pool | own
   },
+  reroll: {
+    // Abort-and-reroll on a session's first request: buffer a short window, and
+    // if the running rate is below the threshold, drop the attempt and retry on
+    // a fresh routing id. Off by default; the A/B arm decides who gets it.
+    enabled: false,
+    windowMs: 2000,
+    thresholdTps: 150,
+    maxRetries: 3,
+    maxPromptTokens: 60000,
+  },
   experiment: {
     // A/B for measuring the route effect. A session is assigned by a stable hash
     // of its id, so it never crosses arms: `treatment` probes and pins, `control`
@@ -142,6 +152,7 @@ export function apply(ctx, config = {}) {
   const inflightProbes = new Map();
   /** @type {WeakSet<object>} */
   const probing = new WeakSet();
+  const rerolling = new WeakSet();
   /** @type {Map<string, number>} */
   const negativeUntil = new Map();
   /** @type {Map<string, {tps: number, ttfb: number, n: number, lastInput: number}>} */
@@ -592,6 +603,9 @@ export function apply(ctx, config = {}) {
   const inflightPins = new Map();
 
   async function ensurePin(provider, model, sessionId, signal) {
+    // The reroll experiment replaces the picker entirely: treatment rerolls the
+    // first request, control does nothing, and no probe traffic runs at all.
+    if (cfg.reroll?.enabled) return undefined;
     if (armOf(sessionId) === 'control') return undefined;
     const key = pairKey(provider, sessionId);
     await pinsReady;
@@ -760,18 +774,124 @@ export function apply(ctx, config = {}) {
   }
 
   // ---- one model call -----------------------------------------------------
+  function chunkChars(chunk) {
+    if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') return chunk.text.length;
+    if (chunk.type === 'tool-call-delta') return (chunk.argumentsDelta?.length ?? 0) + (chunk.name?.length ?? 0);
+    return 0;
+  }
+
+  function mergedSignal(a, b) {
+    if (a === undefined) return b;
+    if (typeof AbortSignal.any === 'function') return AbortSignal.any([a, b]);
+    return b;
+  }
+
+  // Buffers the first window of the accepted attempt, so an aborted attempt is
+  // never shown. `timing` reports the real first/last token of the accepted
+  // stream to the guard, whose own timestamps would otherwise start at the
+  // flush (2 s late).
+  async function* reroll(options, next, timing) {
+    const windowMs = Math.max(300, Math.min(10000, Number(cfg.reroll.windowMs ?? 2000)));
+    const threshold = Math.max(10, Number(cfg.reroll.thresholdTps ?? 150));
+    const maxRetries = Math.max(0, Math.min(6, Number(cfg.reroll.maxRetries ?? 3)));
+    let attempt = 0;
+    while (true) {
+      const own = attempt > 0;
+      const id = own ? `session-${randomUUID()}` : options.sessionId;
+      const controller = new AbortController();
+      const o2 = own ? { ...options, sessionId: id, signal: mergedSignal(options.signal, controller.signal) } : options;
+      if (own) rerolling.add(o2);
+      const attemptStart = performance.now();
+      const iterator = (own ? ctx.llm.stream(o2) : next())[Symbol.asyncIterator]();
+      const buffered = [];
+      let first = null;
+      let last = null;
+      let chars = 0;
+      let slow = false;
+      let early = null;
+      try {
+        for (;;) {
+          const step = await iterator.next();
+          if (step.done === true) break;
+          const chunk = step.value;
+          if (isTokenChunk(chunk)) {
+            const now = performance.now();
+            if (first === null) first = now;
+            last = now;
+            chars += chunkChars(chunk);
+            buffered.push(chunk);
+            if (early === null && now - first >= windowMs) {
+              early = Math.round((chars / 4) / ((now - first) / 1000));
+              if (early < threshold) { slow = true; break; }
+            }
+          } else {
+            buffered.push(chunk);
+          }
+        }
+      } finally {
+        if (slow) {
+          try { await iterator.return?.(); } catch { /* stop consuming */ }
+          if (own) controller.abort();
+        }
+      }
+      const retry = slow && attempt < maxRetries;
+      if (retry) {
+        log({
+          kind: 'reroll', provider: options.provider, model: options.model,
+          sessionId: options.sessionId, attempt, id, early, aborted: true, final: null,
+        });
+        attempt += 1;
+        continue;
+      }
+      // Accept: flush the buffer, then stream the rest with the real timing.
+      timing.first = first;
+      timing.last = last;
+      timing.start = attemptStart;
+      for (const chunk of buffered) yield chunk;
+      for (;;) {
+        const step = await iterator.next();
+        if (step.done === true) break;
+        const chunk = step.value;
+        if (isTokenChunk(chunk)) {
+          const now = performance.now();
+          if (first === null) first = now;
+          last = now;
+          chars += chunkChars(chunk);
+        }
+        yield chunk;
+      }
+      timing.first = first;
+      timing.last = last;
+      log({
+        kind: 'reroll', provider: options.provider, model: options.model,
+        sessionId: options.sessionId, attempt, id, early, aborted: false,
+        final: first !== null && last !== null && last > first ? Math.round((chars / 4) * 1000 / (last - first)) : null,
+      });
+      return;
+    }
+  }
+
   async function* guard(options, next) {
     const provider = options.provider;
     const model = options.model;
     const sessionId = options.sessionId === undefined ? undefined : String(options.sessionId);
     const arm = sessionId === undefined ? 'off' : armOf(sessionId);
     let pinnedId;
-    if (sessionId !== undefined && !cfg.dryRun && arm !== 'control') {
+    const timing = { first: null, last: null, start: null };
+    const baseline = sessionId === undefined ? undefined : baselines.get(pairKey(provider, sessionId));
+    const useReroll = Boolean(cfg.reroll?.enabled)
+      && !cfg.dryRun
+      && arm === 'treatment'
+      && sessionId !== undefined
+      && (baseline?.n ?? 0) === 0
+      && pins.get(pairKey(provider, sessionId)) === undefined
+      && contextTokens(sessionId) <= Number(cfg.reroll.maxPromptTokens ?? 60000);
+    if (sessionId !== undefined && !cfg.dryRun && arm !== 'control' && !useReroll) {
       try {
         pinnedId = await ensurePin(provider, model, sessionId, options.signal);
       } catch { pinnedId = undefined; }
     }
-    const iterator = next()[Symbol.asyncIterator]();
+    const iterator = (useReroll ? reroll(options, next, timing) : next())[Symbol.asyncIterator]();
     let first = null;
     let last = null;
     let usage = null;
@@ -803,7 +923,9 @@ export function apply(ctx, config = {}) {
       const responseId = finish?.replayState?.response?.responseId ?? null;
       const shape = shapeOf(responseId);
       const out = usage?.outputTokens ?? 0;
-      const genMs = first !== null && last !== null ? last - first : 0;
+      const firstAt = timing.first ?? first;
+      const lastAt = timing.last ?? last;
+      const genMs = firstAt !== null && lastAt !== null ? lastAt - firstAt : 0;
       // A short window is a delivery burst, not a generation rate: 47 tokens in
       // 7 ms is not 6,700 tok/s. A long window is not enough either — 1,608
       // tokens buffered in 692 ms reads as 2,322 tok/s — so the implied rate must
@@ -812,7 +934,7 @@ export function apply(ctx, config = {}) {
       const measurable = genMs >= 500 && out >= 60 && rate <= PLAUSIBLE_TPS;
       const tps = measurable ? rate : null;
       const kind = reason?.kind ?? (failed !== undefined ? 'thrown' : 'none');
-      const ttfbMs = first === null ? null : Math.round(first - t0);
+      const ttfbMs = firstAt === null ? null : Math.round(firstAt - (timing.start ?? t0));
       const inputTokens = usage?.inputTokens ?? 0;
       const cacheReadTokens = usage?.cacheReadTokens ?? 0;
       const cacheBase = inputTokens + cacheReadTokens;
@@ -906,6 +1028,7 @@ export function apply(ctx, config = {}) {
 
   ctx.on('llm/stream', (options, next) => {
     try {
+      if (rerolling.has(options)) return next();
       if (!isScope(options.provider, options.model) || probing.has(options)) return next();
       return guard(options, next);
     } catch {
@@ -1085,7 +1208,17 @@ export function apply(ctx, config = {}) {
       enabled: cfg.enabled,
       dryRun: cfg.dryRun,
       arm: sessionId === undefined ? 'off' : armOf(String(sessionId)),
-      experiment: { enabled: expCfg?.enabled === true, armRatio: expCfg?.armRatio ?? null },
+      reroll: {
+    // Abort-and-reroll on a session's first request: buffer a short window, and
+    // if the running rate is below the threshold, drop the attempt and retry on
+    // a fresh routing id. Off by default; the A/B arm decides who gets it.
+    enabled: false,
+    windowMs: 2000,
+    thresholdTps: 150,
+    maxRetries: 3,
+    maxPromptTokens: 60000,
+  },
+  experiment: { enabled: expCfg?.enabled === true, armRatio: expCfg?.armRatio ?? null },
       rate: baseline === undefined || !((baseline.decode ?? 0) > 0)
         ? null
         : {
@@ -1115,7 +1248,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.8.1',
+    version: '1.9.0',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     subagentMode: cfg.subagents.mode,

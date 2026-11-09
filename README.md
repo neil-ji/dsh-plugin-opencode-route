@@ -24,6 +24,13 @@ a shared pool (sub-agent sessions lease from the same pool), and pins it by over
   so a session is pinned once and keeps that route. After 2 turns or 20k tokens it is cache-locked:
   slow turns are logged, not re-routed. A session's *first* request is always allowed to probe, however
   large its prompt: there is no cache to lose before the provider has served that session.
+- **Roll vs no-roll experiment (`reroll`).** When `reroll.enabled` is on, a treatment session's
+  *first* request is buffered for `windowMs` (2 s); if the running rate is below `thresholdTps`
+  (150), the attempt is dropped and retried on a fresh routing id, up to `maxRetries` (3) times.
+  The buffered window is never shown, so the user only sees the accepted attempt. Control sessions
+  are untouched. Parameters were tuned on 323 real first requests (`research/tune_reroll.mjs`):
+  2000 ms / 150 tok/s / 3 retries puts 95% of sessions at >=150 tok/s with 1.75 attempts.
+  Dynamic re-tuning is planned but not implemented — see `research/TODO-tuning.md`.
 - **Corrects a bad estimate once.** A short probe can read ~2× faster than the real request. If the
   first real turn lands below 60% of the probe's number, the route is dropped and re-picked while the
   context is still cheap.
