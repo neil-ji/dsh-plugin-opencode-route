@@ -95,6 +95,7 @@ export function apply(ctx, config = {}) {
   const expCfg = cfg.experiment;
 
   const baselines = new Map();
+  const rerollStatus = new Map();
   const recent = [];
   const counters = { requests: 0, attempts: 0, aborted: 0, failures: 0 };
   // Options issued by this plugin (reroll retries, /route test) must not be
@@ -224,6 +225,13 @@ export function apply(ctx, config = {}) {
   // stream to the guard, whose own timestamps would otherwise start at the
   // flush.
   async function* reroll(options, next, timing) {
+    const sid = options.sessionId === undefined ? null : String(options.sessionId);
+    const mark = (attempt, early) => {
+      if (sid === null) return;
+      rerollStatus.set(sid, { active: true, attempt, early: early ?? null, at: Date.now() });
+      capMap(rerollStatus);
+    };
+    const clear = () => { if (sid !== null) rerollStatus.delete(sid); };
     const windowMs = Math.max(300, Math.min(10000, Number(cfg.reroll.windowMs ?? 2000)));
     const threshold = Math.max(10, Number(cfg.reroll.thresholdTps ?? 150));
     const maxRetries = Math.max(0, Math.min(6, Number(cfg.reroll.maxRetries ?? 3)));
@@ -235,6 +243,7 @@ export function apply(ctx, config = {}) {
       const o2 = own ? { ...options, sessionId: id, signal: mergedSignal(options.signal, controller.signal) } : options;
       if (own) bypass.add(o2);
       const attemptStart = performance.now();
+      mark(attempt, null);
       const iterator = (own ? ctx.llm.stream(o2) : next())[Symbol.asyncIterator]();
       const buffered = [];
       let first = null;
@@ -267,6 +276,7 @@ export function apply(ctx, config = {}) {
       counters.attempts += 1;
       if (slow && attempt < maxRetries) {
         counters.aborted += 1;
+        mark(attempt, early);
         log({
           kind: 'reroll', provider: options.provider, model: options.model,
           sessionId: options.sessionId, attempt, id, early, aborted: true, final: null,
@@ -298,6 +308,7 @@ export function apply(ctx, config = {}) {
         sessionId: options.sessionId, attempt, id, early, aborted: false,
         final: first !== null && last !== null && last > first ? Math.round((chars / 4) * 1000 / (last - first)) : null,
       });
+      clear();
       return;
     }
   }
@@ -380,6 +391,7 @@ export function apply(ctx, config = {}) {
         capMap(baselines);
         locked = next2.n >= 2 || next2.lastInput >= 20000;
       }
+      if (useReroll && sessionId !== undefined) rerollStatus.delete(String(sessionId));
       log({
         kind: 'turn',
         provider,
@@ -518,6 +530,7 @@ export function apply(ctx, config = {}) {
         thresholdTps: cfg.reroll?.thresholdTps ?? null,
         maxRetries: cfg.reroll?.maxRetries ?? null,
       },
+      rerollState: sessionId === undefined ? null : (rerollStatus.get(String(sessionId)) ?? null),
       rate: baseline === undefined || !((baseline.decode ?? 0) > 0)
         ? null
         : {
@@ -539,7 +552,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.10.1',
+    version: '1.10.2',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     reroll: cfg.reroll?.enabled ? { windowMs: cfg.reroll.windowMs, thresholdTps: cfg.reroll.thresholdTps, maxRetries: cfg.reroll.maxRetries } : null,

@@ -38,6 +38,7 @@ window.__ModuleLoader__.load({
 .orDot.fast{background:#22c55e}
 .orDot.slow{background:#f59e0b}
 .orDot.off{background:var(--or-fg2,#61666b)}
+.orDot.busy{background:var(--or-fg,#0f1115);animation:orPulse 1s ease-in-out infinite}
 .orLabel{display:inline-flex;align-items:center;gap:6px;min-width:0}
 .orNum{font-variant-numeric:tabular-nums;color:var(--or-fg,#0f1115);
   width:60px;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -48,9 +49,10 @@ window.__ModuleLoader__.load({
   overflow:hidden;vertical-align:baseline}
 .orRollOld{position:absolute;left:0;top:0;animation:orRollOut .2s ease-in forwards}
 .orRollNew{display:inline-block;animation:orRollIn .2s ease-out}
+@keyframes orPulse { 0%{opacity:.35} 50%{opacity:1} 100%{opacity:.35} }
 @keyframes orRollIn{from{transform:translateY(100%)}to{transform:translateY(0)}}
 @keyframes orRollOut{from{transform:translateY(0)}to{transform:translateY(-100%)}}
-@media (prefers-reduced-motion: reduce){.orRollOld{display:none}.orRollNew{animation:none}}
+@media (prefers-reduced-motion: reduce){.orRollOld{display:none}.orRollNew{animation:none}.orDot.busy{animation:none}}
 /* Text states (待选/对照组) are transient, so they size to their content
    instead of reserving the numeric slot: that is where most of the width went. */
 .orNum.text{width:auto;text-align:left}
@@ -176,6 +178,7 @@ window.__ModuleLoader__.load({
           document.head.appendChild(style);
         }
         let running = false;
+        let fast = false;
         const tick = async () => {
           if (!alive || running) return;
           // A hidden window does not need a 3 s poll; check rarely and refresh
@@ -189,6 +192,10 @@ window.__ModuleLoader__.load({
             const res = await fetch(`/opencode-route/status?session=${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
             if (res.ok && alive) {
               const next = await res.json();
+              // While the first request is still in flight, poll fast enough to
+              // catch the 2 s测速 window and any retry.
+              fast = next.rerollState?.active === true
+                || (Array.isArray(next.turns) && next.turns.length === 0 && next.arm === 'treatment');
               dataId.current = sessionId;
               remember(sessionId, next);
               setData(next);
@@ -201,7 +208,7 @@ window.__ModuleLoader__.load({
           } finally {
             running = false;
           }
-          if (alive) timer = setTimeout(tick, 3000);
+          if (alive) timer = setTimeout(tick, fast ? 700 : 3000);
         };
         const onVisible = () => {
           if (document.hidden) return;
@@ -271,9 +278,13 @@ window.__ModuleLoader__.load({
       // across the session, so one buffered burst cannot move it.
       const rate = current.rate && typeof current.rate.tps === 'number' && current.rate.tps > 0 ? current.rate.tps : null;
       const tps = rate ?? median;
+      const rerolling = current.rerollState?.active === true;
       let dot = 'off';
       let textLabel = null;
-      if (control) { dot = 'off'; textLabel = '对照组'; }
+      if (rerolling) {
+        dot = 'busy';
+        textLabel = current.rerollState.attempt > 0 ? `重试 ${current.rerollState.attempt}…` : '测速…';
+      } else if (control) { dot = 'off'; textLabel = '对照组'; }
       else if (tps !== null) { dot = tps >= 150 ? 'fast' : 'slow'; }
       else textLabel = '待选';
 
@@ -311,9 +322,11 @@ window.__ModuleLoader__.load({
 
       // One atomic status sentence for assistive tech; the visible parts are
       // aria-hidden so a polling update does not announce a bare number.
-      const statusText = control
-        ? '实验对照组，不回滚重试'
-        : tps !== null ? `当前 ${formatSpeed(tps)} tok/s` : '还没有足够长的样本';
+      const statusText = rerolling
+        ? (current.rerollState.attempt > 0 ? `正在重试第 ${current.rerollState.attempt} 次` : '正在测速')
+        : control
+          ? '实验对照组，不回滚重试'
+          : tps !== null ? `当前 ${formatSpeed(tps)} tok/s` : '还没有足够长的样本';
       return h(React.Fragment, null,
         h('div', {
           className: 'orCapsule',
