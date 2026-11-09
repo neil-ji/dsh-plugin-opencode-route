@@ -493,6 +493,7 @@ export function apply(ctx, config = {}) {
       .slice(-6)
       .map((row) => ({
         ts: row.ts,
+        sessionId: row.sessionId,
         shape: row.shape,
         tps: row.tps,
         decodeMs: row.decodeMs ?? null,
@@ -538,7 +539,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.10.0',
+    version: '1.10.1',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     reroll: cfg.reroll?.enabled ? { windowMs: cfg.reroll.windowMs, thresholdTps: cfg.reroll.thresholdTps, maxRetries: cfg.reroll.maxRetries } : null,

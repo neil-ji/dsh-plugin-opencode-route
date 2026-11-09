@@ -26,7 +26,6 @@ window.__ModuleLoader__.load({
       while (SESSION_CACHE.size > CACHE_LIMIT) SESSION_CACHE.delete(SESSION_CACHE.keys().next().value);
     }
     const CSS = `
-@keyframes orPulse { 0%{opacity:.35} 50%{opacity:1} 100%{opacity:.35} }
 /* Matches the native session-header control: border-box 24px tall, 8px radius, 1px
    border-l2, transparent fill. A read-only badge: dot, optional arm tag, number. */
 .orCapsule{box-sizing:border-box;display:inline-flex;align-items:center;align-self:center;gap:6px;
@@ -38,7 +37,6 @@ window.__ModuleLoader__.load({
 .orDot{width:5px;height:5px;border-radius:50%;flex:none;background:var(--or-fg2,#61666b)}
 .orDot.fast{background:#22c55e}
 .orDot.slow{background:#f59e0b}
-.orDot.busy{background:var(--or-fg,#0f1115);animation:orPulse 1s ease-in-out infinite}
 .orDot.off{background:var(--or-fg2,#61666b)}
 .orLabel{display:inline-flex;align-items:center;gap:6px;min-width:0}
 .orNum{font-variant-numeric:tabular-nums;color:var(--or-fg,#0f1115);
@@ -64,7 +62,6 @@ window.__ModuleLoader__.load({
   background:rgba(127,127,127,.18);margin-left:auto}
 .orSrOnly{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
   clip:rect(0 0 0 0);white-space:nowrap;border:0}
-@media (prefers-reduced-motion: reduce){ .orDot.busy{animation:none} }
 .orTip{position:fixed;z-index:10000;display:flex;flex-direction:column;gap:4px;font-size:11px;line-height:16px;
   color:var(--or-fg2,#61666b);padding:9px 11px;border-radius:8px;max-width:420px;min-width:230px;
   background:var(--or-surface,#fff);border:1px solid var(--or-border,rgba(0,0,0,.16));
@@ -172,7 +169,6 @@ window.__ModuleLoader__.load({
         setFailures(0);
         let alive = true;
         let timer;
-        let state = null;
         if (!document.getElementById(STYLE_ID)) {
           const style = document.createElement('style');
           style.id = STYLE_ID;
@@ -193,7 +189,6 @@ window.__ModuleLoader__.load({
             const res = await fetch(`/opencode-route/status?session=${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
             if (res.ok && alive) {
               const next = await res.json();
-              state = next.state;
               dataId.current = sessionId;
               remember(sessionId, next);
               setData(next);
@@ -330,11 +325,8 @@ window.__ModuleLoader__.load({
           onMouseLeave: scheduleHide,
         },
           h('span', { className: `orDot ${dot}`, 'aria-hidden': 'true' }),
-          current.experiment && current.experiment.enabled
-            ? h('span', {
-              className: 'orTag',
-              title: control ? 'A/B 实验：对照组' : 'A/B 实验：处理组',
-            }, '实验')
+          current.experiment && current.experiment.enabled && !control
+            ? h('span', { className: 'orTag', title: 'A/B 实验：回滚组' }, '实验')
             : null,
           h('span', { className: 'orLabel' },
             h('span', { className: textLabel !== null ? 'orNum text' : 'orNum', 'aria-hidden': 'true' },
@@ -351,7 +343,7 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
           // Leftmost in the right-aligned utilities row: this chip's width changes
-          // with the number (and with 挑选中/对照组), so it must not sit in front
+          // with the number (and with 对照组), so it must not sit in front
           // of any other cell. Being first, its growth only moves its own left edge.
           name: 'conversation.session.header.utilities', id: 'opencode-route', order: -100,
         }, Chip));
