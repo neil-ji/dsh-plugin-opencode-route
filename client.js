@@ -60,7 +60,7 @@ window.__ModuleLoader__.load({
   border-radius:8px;background:rgba(127,127,127,.12);
   font-size:9px;font-weight:600;line-height:1;letter-spacing:.04em;
   color:var(--or-fg2,#61666b)}
-.orDots{display:inline-flex;align-items:center;gap:3px;margin-left:4px}
+.orDots{display:inline-flex;align-items:center;height:1em;vertical-align:middle;gap:3px;margin-left:4px}
 .orDots i{width:4px;height:4px;border-radius:50%;background:currentColor;opacity:.25;
   animation:orDots 1.2s ease-in-out infinite}
 .orDots i:nth-child(2){animation-delay:.15s}
