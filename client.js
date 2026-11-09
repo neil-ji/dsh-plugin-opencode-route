@@ -352,7 +352,7 @@ window.__ModuleLoader__.load({
         },
           h('span', { className: `orDot ${dot}`, 'aria-hidden': 'true' }),
           current.experiment && current.experiment.enabled && !control
-            ? h('span', { className: 'orTag', title: 'A/B 实验：回滚组' }, '实验')
+            ? h('span', { className: 'orTag', title: 'A/B 实验：回滚组' }, '实验组')
             : null,
           h('span', { className: 'orLabel' },
             h('span', { className: textLabel !== null ? 'orNum text' : 'orNum', 'aria-hidden': 'true' },

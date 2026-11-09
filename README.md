@@ -55,7 +55,7 @@ config:
 - **Header capsule**: a read-only badge in the session header. The number is the
   session's weighted rate — total output tokens over total decode time, the same
   definition DSH's composer footer uses — falling back to the median of the last
-  three usable requests. During an A/B a plain `实验` label marks the arm
+  three usable requests. During an A/B a plain `实验组` label marks the arm
   (control sessions read `对照组`). Hover it for the last three requests (time,
   speed, first token, cache). No prose, no manual action.
 - **`/route`**: dump of the current arm, parameters, counters and recent turns.
