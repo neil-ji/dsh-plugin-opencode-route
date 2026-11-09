@@ -93,11 +93,20 @@ const allSessions = [...bySession.entries()].map(([session, list]) => {
   const usable = list.filter((t) => t.tps !== null && t.tps !== undefined && t.out >= MIN_OUT
     && (t.decodeMs === null || t.decodeMs === undefined || t.decodeMs >= MIN_DECODE));
   const arm = list[0].arm;
+  // The reroll only touches the session's first request, so that request is the
+  // primary endpoint. `first` marks it in the log; fall back to the first
+  // measurable turn when the first request itself was too short to measure.
+  const literal = list.find((t) => t.first === true && t.tps !== null && t.tps !== undefined
+    && t.out >= MIN_OUT && (t.decodeMs === null || t.decodeMs === undefined || t.decodeMs >= MIN_DECODE));
+  const firstMeasured = literal ?? usable[0] ?? null;
   return {
     session,
     arm,
     turns: list.length,
     usable: usable.length,
+    firstTps: firstMeasured === null ? null : firstMeasured.tps,
+    firstIsLiteral: literal !== undefined,
+    firstTurn: list.find((t) => t.tps !== null && t.tps !== undefined)?.ts ?? list[0].ts,
     day: new Date(list[0].ts).toLocaleDateString('en-CA'),
     firstTs: Date.parse(list[0].ts),
     tps: usable.length ? med(usable.map((t) => t.tps)) : null,
@@ -115,8 +124,8 @@ if (groups.treatment.length === 0 || groups.control.length === 0) {
   process.exit(1);
 }
 
-const report = (name, list) => {
-  const t = list.map((s) => s.tps);
+const report = (name, list, key = 'tps') => {
+  const t = list.map((s) => s[key]).filter((x) => typeof x === 'number');
   const ttfb = list.map((s) => s.ttfb).filter((x) => x !== null);
   console.log(`${name.padEnd(10)} sessions ${String(list.length).padStart(4)} · median tps p25 ${n0(q(t, 0.25))} p50 ${n0(med(t))} p75 ${n0(q(t, 0.75))} · TTFB p50 ${n0(med(ttfb))}ms · cache ${n0(med(list.map((s) => s.cacheHit).filter((x) => x !== null)))}% · error ${n0(mean(list.map((s) => s.failure)) * 100)}%`);
 };
@@ -135,15 +144,23 @@ const routed = new Set(events
 const treated = groups.treatment.filter((s) => routed.has(s.session));
 const untouched = groups.treatment.length - treated.length;
 
+const firstOf = (list) => list.filter((s) => typeof s.firstTps === 'number');
+const groupsFirst = { treatment: firstOf(groups.treatment), control: firstOf(groups.control) };
+
 console.log('');
+console.log('## 首请求（主指标：reroll 只作用于这一次请求）');
+report('treatment', groupsFirst.treatment, 'firstTps');
+report('control', groupsFirst.control, 'firstTps');
+console.log(`# 其中首个可测请求就是首请求的会话：treatment ${groupsFirst.treatment.filter((s) => s.firstIsLiteral).length}/${groupsFirst.treatment.length} · control ${groupsFirst.control.filter((s) => s.firstIsLiteral).length}/${groupsFirst.control.length}`);
+console.log('');
+console.log('## 会话中位（ITT 参考：干预被后续轮次稀释）');
 report('treatment', groups.treatment);
-report('treated', treated);
 report('control', groups.control);
 
 // Day-stratified bootstrap: resample sessions inside each day, so the arm
 // comparison is made within the same days and daily gateway drift cancels.
 const pick = (list, n) => Array.from({ length: n }, () => list[Math.floor(Math.random() * list.length)]);
-function compareArms(aList, bList) {
+function compareArms(aList, bList, key = 'tps') {
   const days = [...new Set([...aList, ...bList].map((s) => s.day))].sort();
   const index = new Map(days.map((d) => [d, {
     a: aList.filter((s) => s.day === d),
@@ -160,13 +177,13 @@ function compareArms(aList, bList) {
       if (cell.b.length) b.push(...pick(cell.b, cell.b.length));
     }
     if (!a.length || !b.length) continue;
-    ratios.push(med(a.map((s) => s.tps)) / med(b.map((s) => s.tps)));
-    gains.push(Math.exp(mean(a.map((s) => Math.log(s.tps))) - mean(b.map((s) => Math.log(s.tps)))));
+    ratios.push(med(a.map((s) => s[key])) / med(b.map((s) => s[key])));
+    gains.push(Math.exp(mean(a.map((s) => Math.log(s[key]))) - mean(b.map((s) => Math.log(s[key])))));
   }
   ratios.sort((x, y) => x - y);
   gains.sort((x, y) => x - y);
   return {
-    point: med(aList.map((s) => s.tps)) / med(bList.map((s) => s.tps)),
+    point: med(aList.map((s) => s[key])) / med(bList.map((s) => s[key])),
     lo: q(ratios, 0.025),
     hi: q(ratios, 0.975),
     gain: gains.length ? med(gains) : null,
@@ -176,14 +193,15 @@ function compareArms(aList, bList) {
   };
 }
 
+const first = groupsFirst.treatment.length >= 2 && groupsFirst.control.length >= 2
+  ? compareArms(groupsFirst.treatment, groupsFirst.control, 'firstTps')
+  : null;
 const itt = compareArms(groups.treatment, groups.control);
-console.log(`\n会话级中位 tps 比值 treatment/control = ${n2(itt.point)}x  (day-stratified bootstrap 95% CI ${n2(itt.lo)}–${n2(itt.hi)}x, B=${itt.B})`);
-console.log(`log-mean 比值 = ${n2(itt.gain)}x  (95% CI ${n2(itt.gainLo)}–${n2(itt.gainHi)}x)`);
-if (treated.length > 0) {
-  const pp = compareArms(treated, groups.control);
-  console.log(`per-protocol（仅实际跑过选路的 ${treated.length} 个处理组会话）= ${n2(pp.point)}x  (95% CI ${n2(pp.lo)}–${n2(pp.hi)}x)`);
-  console.log(`处理组中未实际处理的会话 ${untouched} 个（cache-locked，等价于对照）`);
+if (first !== null) {
+  console.log(`\n首请求 tps 比值 treatment/control = ${n2(first.point)}x  (day-stratified bootstrap 95% CI ${n2(first.lo)}–${n2(first.hi)}x, B=${first.B})`);
+  console.log(`log-mean 比值 = ${n2(first.gain)}x  (95% CI ${n2(first.gainLo)}–${n2(first.gainHi)}x)`);
 }
+console.log(`会话中位 tps 比值（ITT 参考）= ${n2(itt.point)}x  (95% CI ${n2(itt.lo)}–${n2(itt.hi)}x, B=${itt.B})`);
 
 // Integrity: a control session must never have produced probe traffic.
 const probeSessions = new Set(events.filter((e) => e.kind === 'probe' || e.kind === 'probe-reject' || e.kind === 'probe-dead').map((e) => e.sessionId).filter(Boolean));
@@ -194,23 +212,18 @@ if (violations.length) console.log(`  ${violations.slice(0, 5).join(', ')}…`);
 
 // Verdict against the pre-registered rule.
 console.log('\n## 判读');
-if (groups.treatment.length < 20 || groups.control.length < 20) {
-  console.log(`样本不足（${groups.treatment.length}/${groups.control.length} 会话），判读无效；先跑到 ≥20 会话/臂。`);
-} else if (itt.lo > 1.05) {
-  console.log(`有效：CI 下界 ${n2(itt.lo)}x > 1.05，且该方向与探测逻辑一致。`);
+const nT = first === null ? groupsFirst.treatment.length : groupsFirst.treatment.length;
+const nC = groupsFirst.control.length;
+const primary = first ?? itt;
+if (groupsFirst.treatment.length < 20 || groupsFirst.control.length < 20) {
+  console.log(`样本不足（首请求 ${groupsFirst.treatment.length}/${groupsFirst.control.length} 会话），判读无效；按当前方差，30-40/臂可做初步判读。`);
+} else if (primary.lo > 1.05) {
+  console.log(`有效：首请求 CI 下界 ${n2(primary.lo)}x > 1.05，方向与 reroll 逻辑一致。`);
   if (treated.length > 0) console.log('per-protocol 口径见上：若它明显高于 ITT，说明效应集中在真正被选路的会话上。');
-} else if (itt.hi < 1) {
-  console.log(`负向：CI 上界 ${n2(itt.hi)}x < 1，选道在拖慢会话；检查 SHAPE_RANK 与缓存代价。`);
+} else if (primary.hi < 1) {
+  console.log(`负向：首请求 CI 上界 ${n2(primary.hi)}x < 1，reroll 在拖慢首请求。`);
 } else {
-  const perArm = Math.min(groups.treatment.length, groups.control.length);
-  const next = perArm >= 60
-    ? '已到 60/臂仍跨 1，可以判定"当前数据不支持"'
-    : perArm >= 34
-      ? '补到 ≥60 会话/臂可把分辨率提到 1.1x'
-      : perArm >= 20
-        ? '补到 ≥34 会话/臂可检测 1.2x'
-        : '先跑到 ≥20 会话/臂可判读';
-  console.log(`无法证明：CI ${n2(itt.lo)}–${n2(itt.hi)}x 跨 1；${next}。`);
+  console.log(`无法证明：首请求 CI ${n2(primary.lo)}–${n2(primary.hi)}x 跨 1；继续补样到 60-80/臂可检测 1.25x。`);
 }
 
 if (args.get('baseline')) {

@@ -395,6 +395,7 @@ export function apply(ctx, config = {}) {
       const cacheReadTokens = usage?.cacheReadTokens ?? 0;
       const cacheBase = inputTokens + cacheReadTokens;
       const cacheHit = cacheBase > 0 ? cacheReadTokens / cacheBase : null;
+      const firstRequest = sessionId !== undefined && (baselines.get(pairKey(provider, sessionId))?.n ?? 0) === 0;
       let locked = false;
       if (sessionId !== undefined) {
         const key = pairKey(provider, sessionId);
@@ -421,6 +422,7 @@ export function apply(ctx, config = {}) {
         model,
         sessionId,
         arm,
+        first: firstRequest,
         locked,
         shape,
         out,
@@ -575,7 +577,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.10.8',
+    version: '1.10.9',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     reroll: cfg.reroll?.enabled ? { windowMs: cfg.reroll.windowMs, thresholdTps: cfg.reroll.thresholdTps, maxRetries: cfg.reroll.maxRetries } : null,
