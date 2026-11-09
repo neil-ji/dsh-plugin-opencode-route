@@ -202,7 +202,15 @@ if (groups.treatment.length < 20 || groups.control.length < 20) {
 } else if (itt.hi < 1) {
   console.log(`负向：CI 上界 ${n2(itt.hi)}x < 1，选道在拖慢会话；检查 SHAPE_RANK 与缓存代价。`);
 } else {
-  console.log(`无法证明：CI ${n2(itt.lo)}–${n2(itt.hi)}x 跨 1。按实测效应量补样（目标 ≥20 会话/臂可判读），或判定"当前数据不支持"。`);
+  const perArm = Math.min(groups.treatment.length, groups.control.length);
+  const next = perArm >= 60
+    ? '已到 60/臂仍跨 1，可以判定"当前数据不支持"'
+    : perArm >= 34
+      ? '补到 ≥60 会话/臂可把分辨率提到 1.1x'
+      : perArm >= 20
+        ? '补到 ≥34 会话/臂可检测 1.2x'
+        : '先跑到 ≥20 会话/臂可判读';
+  console.log(`无法证明：CI ${n2(itt.lo)}–${n2(itt.hi)}x 跨 1；${next}。`);
 }
 
 if (args.get('baseline')) {
