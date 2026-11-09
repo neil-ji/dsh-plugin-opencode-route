@@ -260,7 +260,7 @@ export function apply(ctx, config = {}) {
   ]);
   void (async () => {
     try {
-      if (cacheCfg.persistPins) {
+      if (cacheCfg.persistPins && !cfg.reroll?.enabled) {
         const raw = await readFile(pinsPath, 'utf8');
         const parsed = JSON.parse(raw);
         const cutoff = Date.now() - 86_400_000;
@@ -1040,6 +1040,9 @@ export function apply(ctx, config = {}) {
     const out = next();
     try {
       if (cfg.dryRun || !cfg.enabled) return out;
+      // The reroll experiment owns routing: a pin restored from an older config
+      // must not override the id the attempt was issued with.
+      if (cfg.reroll?.enabled) return out;
       if (!isScope(request.provider, request.model)) return out;
       if (request.sessionId === undefined) return out;
       // A control session never receives a pin, even if one survived from an
@@ -1248,7 +1251,7 @@ export function apply(ctx, config = {}) {
 
   log({
     kind: 'plugin',
-    version: '1.9.0',
+    version: '1.9.1',
     dryRun: cfg.dryRun,
     providers: cfg.providers,
     subagentMode: cfg.subagents.mode,
